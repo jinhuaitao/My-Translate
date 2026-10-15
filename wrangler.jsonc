@@ -2,7 +2,6 @@
   // Cloudflare Workers 配置文件
   // 连接 GitHub 部署（Workers Builds）时，构建流程执行 `npx wrangler deploy`，
   // 会自动读取本文件 —— 所以这里的绑定会「跟着部署一起生效」，无需再去控制台手点。
-
   "$schema": "node_modules/wrangler/config-schema.json",
 
   // Worker 名称：Dashboard 里连接的 Worker 名请与此保持一致，
@@ -18,8 +17,7 @@
   // 保留 workers.dev 子域访问（不配置则需自定义域名才能访问）
   "workers_dev": true,
 
-  // 开启线上日志 + 源码映射，异常堆栈能还原到 worker.js 的真实行号。
-  // 配合 package.json 里的 `npm run tail` 可实时查看日志。
+  // 开启线上日志 + 源码映射，异常堆栈能还原到 worker.js 的真实行号
   "observability": { "enabled": true },
   "upload_source_maps": true,
 
@@ -29,15 +27,5 @@
   // 部署后 env.AI 就可用，对应 worker.js 里的 env.AI.run(...)。
   "ai": {
     "binding": "AI"
-  },
-
-  // 运行时变量：换模型只改这里 + 重新部署，worker.js 不用动。
-  // 留空字符串时 worker.js 会回退到内置的 DEFAULT_MODEL。
-  "vars": {
-    "MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
-
-    // 排障开关：设为 "1" 后，/api/tts 失败时响应会附带模型真实报错（detail 字段），
-    // 前端 toast 同步显示，便于定位「语音合成失败」的具体原因；排查完建议改回 "0"。
-    "TTS_DEBUG": "0"
   }
 }

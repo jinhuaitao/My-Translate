@@ -1216,6 +1216,38 @@ const HTML = `<!DOCTYPE html>
     speakingBtn = null;
   }
 
+  /* ---------- 语音列表（Chrome 异步加载，Safari 同步） ---------- */
+
+  var voicesCache = [];
+
+  function loadVoices() {
+    try {
+      voicesCache = window.speechSynthesis.getVoices() || [];
+    } catch (e) { voicesCache = []; }
+  }
+
+  function normalizeLang(l) {
+    return String(l || '').toLowerCase().replace('_', '-');
+  }
+
+  // 显式挑音色：只设 utter.lang 时，Safari / 部分 Chrome 会用系统默认音（常见为中文）
+  // 去读英文，表现为「读英文有问题、中文没问题」；这里按 BCP-47 精确匹配再退到同语族。
+  function pickVoice(lang) {
+    if (!voicesCache.length) loadVoices();
+    if (!voicesCache.length) return null;
+    var want = normalizeLang(lang);
+    var prefix = want.split('-')[0];
+    var exact = null, sameFamily = null;
+    for (var i = 0; i < voicesCache.length; i++) {
+      var v = voicesCache[i];
+      var vl = normalizeLang(v && v.lang);
+      if (!vl) continue;
+      if (vl === want) { exact = v; break; }
+      if (!sameFamily && vl.split('-')[0] === prefix) sameFamily = v;
+    }
+    return exact || sameFamily;
+  }
+
   function speak(type) {
     if (!('speechSynthesis' in window)) { showToast('当前浏览器不支持朗读'); return; }
 
@@ -1240,6 +1272,13 @@ const HTML = `<!DOCTYPE html>
 
     var utter = new SpeechSynthesisUtterance(text);
     utter.lang = lang;
+    var voice = pickVoice(lang);
+    if (voice) {
+      utter.voice = voice;
+    } else if (langKey !== 'auto' && normalizeLang(lang).split('-')[0] !== 'zh') {
+      // 没找到匹配音色：多半是系统没装对应语言语音包，明确告知而不是继续用中文音硬读
+      showToast('系统缺少该语言的语音包，请在系统设置中下载后重试');
+    }
     utter.onend = resetSpeaking;
     utter.onerror = resetSpeaking;
 
@@ -1449,6 +1488,17 @@ const HTML = `<!DOCTYPE html>
   window.addEventListener('beforeunload', function () {
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   });
+
+  // Chrome 首屏 getVoices() 为空、靠 voiceschanged 异步回调；提前加载并在变更时刷新缓存，
+  // 否则第一次点朗读时 voicesCache 还是空的，匹配不到音色
+  if ('speechSynthesis' in window) {
+    loadVoices();
+    if (window.speechSynthesis.addEventListener) {
+      window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    } else {
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+    }
+  }
 
   function updateNetBadge() {
     els.netBadge.classList.toggle('hidden', navigator.onLine !== false);

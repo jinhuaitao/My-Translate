@@ -96,6 +96,7 @@ curl -X POST https://<your-worker>.workers.dev/api/translate \
 
 ## 已知限制
 
+- **朗读依赖系统语音包**：读英文异常（如用中文音读英文）通常是系统缺少对应语言语音。macOS：系统设置 → 辅助功能 → 朗读内容 → 系统声音；Windows：设置 → 时间和语言 → 语音；iOS/Android：设置 → 辅助功能 → 语音。下载英文等语言包后即可正常朗读，应用会自动匹配对应音色
 - 限流为单 isolate 内存态，多地域部署时是近似值；如需硬限制请接 Durable Objects 或 CF Rate Limiting 规则
 - OCR 首次使用需从 CDN 下载语言包（约几 MB），之后走浏览器缓存
 - Tailwind 为 Play CDN（零构建的代价）；如需生产级性能可改为构建产物并收紧 CSP

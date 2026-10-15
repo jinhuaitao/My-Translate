@@ -47,9 +47,13 @@
  */
 
 // 主模型：默认走 wrangler.jsonc 里 vars.MODEL，未配置时用这个
-const DEFAULT_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
-// 主模型额度耗尽 / 容量不足时的降级备选（可自行增删，需为 Workers AI 已上线模型）
-const FALLBACK_MODELS = ['@cf/meta/llama-3.3-70b-instruct-fp8-fast'];
+const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+// 主模型不可用或额度不足时的降级备选（均为当前 Workers AI 在线模型）
+const FALLBACK_MODELS = [
+  '@cf/meta/llama-3.1-8b-instruct-fp8',
+  '@cf/meta/llama-4-scout-17b-16e-instruct',
+  '@cf/zai-org/glm-4.7-flash'
+];
 
 // 语音合成（TTS）模型：
 //   主路径：全语种统一 @cf/myshell-ai/melotts，处理路径只有一条、行为可预期
@@ -350,7 +354,7 @@ async function wrapAiStream(upstream) {
 
 // 主模型不可用（额度/容量/流初始化失败）时按顺序降级
 async function runWithFailover(env, model, params) {
-  const models = [model].concat(FALLBACK_MODELS);
+  const models = Array.from(new Set([model, DEFAULT_MODEL].concat(FALLBACK_MODELS))).filter(Boolean);
   let lastError = null;
   for (let i = 0; i < models.length; i++) {
     const m = models[i];

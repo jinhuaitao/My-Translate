@@ -28,9 +28,9 @@
  *   - 新增 CSP / HSTS / COOP / X-Robots-Tag 安全响应头
  *   - 源语言缺省改为 auto；语种扩到 15 种（朗读 / OCR / 语种检测同步补齐）
  *   - 修复语种检测优先级：含日文汉字的句子不再被误判为中文
- *   - TTS 整体替换：浏览器 speechSynthesis → Workers AI TTS；
- *     英文原用 Deepgram Aura-2 出现音频拼接异常（读得很乱），
- *     现全语种统一 MeloTTS，并补 ReadableStream 读取合并与空音频防护
+ *   - TTS 整体替换：浏览器 speechSynthesis → Workers AI（英文 Deepgram Aura-2、
+ *     其他语言 MeloTTS），前端改 Audio 播放；彻底摆脱「系统语音包缺失/默认中文音
+ *     读英文」问题
  *   - 前端：流式光标、debounce 定时器清理、OCR 降采样与防重复拍照、
  *           文本域高度封顶、SW 更新提示、历史面板 inert / 焦点管理
  *
@@ -51,10 +51,11 @@ const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 // 主模型额度耗尽 / 容量不足时的降级备选（可自行增删，需为 Workers AI 已上线模型）
 const FALLBACK_MODELS = ['@cf/meta/llama-3.1-8b-instruct-fast'];
 
-// 语音合成（TTS）模型：全语种统一走多语言 MeloTTS，处理路径只有一条、行为可预期。
-// （英文曾用 Deepgram Aura-2，实际合成音频出现拼接异常、「读得很乱」，已弃用；
-//   如想换回，把 handleTts 里的英文分支恢复、参数 { text, speaker } 即可。）
-const TTS_MODEL = '@cf/myshell-ai/melotts';
+// 语音合成（TTS）模型：英文走 Deepgram Aura-2（音质好、延迟低），
+// 其他语言走多语言 MeloTTS。均按需计费，不合成不花钱。
+const TTS_MODEL_EN = '@cf/deepgram/aura-2-en';
+const TTS_MODEL_MULTI = '@cf/myshell-ai/melotts';
+const TTS_SPEAKER_EN = 'asteria';      // Aura-2 英文音色：asteria/luna/stella/athena/hera/orion 等
 const TTS_MAX_CHARS = 1000;            // 单次合成字符上限（兼顾时长与延迟）
 
 const MAX_INPUT_CHARS = 3000;      // 单次翻译字符上限（前后端一致）
@@ -462,29 +463,6 @@ async function toAudioBytes(result) {
   if (result instanceof Uint8Array) return result;
   if (result instanceof ArrayBuffer) return new Uint8Array(result);
   if (typeof result === 'string') return base64ToBytes(result);
-  if (typeof result.getReader === 'function') {
-    // 上游返回分块流：必须读完整并拼接成单段音频再下发。
-    // 若把流直接透传而不处理，前端拿到的可能是「多个音频分段」，
-    // 播放出来就是片段反复/杂音，即「读得很乱」。
-    const reader = result.getReader();
-    const chunks = [];
-    let total = 0;
-    for (;;) {
-      const step = await reader.read();
-      if (step.done) break;
-      if (step.value && step.value.length) {
-        chunks.push(step.value);
-        total += step.value.length;
-      }
-    }
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (let i = 0; i < chunks.length; i++) {
-      out.set(chunks[i], offset);
-      offset += chunks[i].length;
-    }
-    return total ? out : null;
-  }
   if (typeof result.arrayBuffer === 'function') {
     return new Uint8Array(await result.arrayBuffer()); // Response-like
   }
@@ -547,26 +525,34 @@ async function handleTts(request, env) {
     }, 500);
   }
 
-  // lang 由前端传 BCP-47（en-US / zh-CN ...），取两位语种码喂给 MeloTTS
+  // lang 由前端传 BCP-47（en-US / zh-CN ...），按前缀分流：
+  // 英文走 Deepgram Aura-2（音质好），其余走多语言 MeloTTS
   const prefix = String(payload.lang || 'en-US').toLowerCase().split('-')[0] || 'en';
-  const params = { text: text, lang: prefix };
+  let model, params, mime;
+  if (prefix === 'en') {
+    model = TTS_MODEL_EN;
+    params = { text: text, speaker: TTS_SPEAKER_EN };
+    mime = 'audio/mpeg';
+  } else {
+    model = TTS_MODEL_MULTI;
+    params = { text: text, lang: prefix };
+    mime = 'audio/wav';
+  }
 
   try {
-    const result = await env.AI.run(TTS_MODEL, params);
+    const result = await env.AI.run(model, params);
     const bytes = await toAudioBytes(result);
     if (!bytes || !bytes.length) {
       return jsonResponse({ error: '模型没有返回音频，请稍后重试' }, 502);
     }
     return new Response(bytes, {
       headers: {
-        'Content-Type': 'audio/wav',
-        'Cache-Control': 'no-store',
-        // 关掉中间层缓冲，避免音频被分段缓冲后拼接异常
-        'X-Accel-Buffering': 'no'
+        'Content-Type': mime,
+        'Cache-Control': 'no-store'
       }
     });
   } catch (err) {
-    log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL });
+    log('error', 'tts_failed', { error: safeErr(err), model: model });
     return jsonResponse({ error: '语音合成失败，请稍后重试' }, 502);
   }
 }
@@ -1408,12 +1394,6 @@ const HTML = `<!DOCTYPE html>
       if (ct.indexOf('audio/') !== 0) throw new Error('服务端返回了非音频内容');
       return res.blob();
     }).then(function (blob) {
-      // 空 blob / 异常小的数据多半是模型返回损坏，直接提示而不是播放出杂音
-      if (!blob || blob.size < 64) {
-        stopSpeaking();
-        showToast('音频数据异常，请重试');
-        return;
-      }
       audioEl = new Audio(URL.createObjectURL(blob));
       audioEl.onended = stopSpeaking;
       audioEl.onerror = function () { stopSpeaking(); showToast('播放失败，请重试'); };

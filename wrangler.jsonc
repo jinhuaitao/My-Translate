@@ -1,0 +1,31 @@
+{
+  // Cloudflare Workers 配置文件
+  // 连接 GitHub 部署（Workers Builds）时，构建流程执行 `npx wrangler deploy`，
+  // 会自动读取本文件 —— 所以这里的绑定会「跟着部署一起生效」，无需再去控制台手点。
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // Worker 名称：Dashboard 里连接的 Worker 名请与此保持一致，
+  // 否则构建产物会被部署到另一个同名 Worker 上。
+  "name": "ai-translate",
+
+  // 入口文件（模块化 Worker，export default { fetch }）
+  "main": "worker.js",
+
+  // 兼容日期：决定 Workers 运行时行为，建议等于首次创建日期
+  "compatibility_date": "2026-10-15",
+
+  // 保留 workers.dev 子域访问（不配置则需自定义域名才能访问）
+  "workers_dev": true,
+
+  // 开启线上日志 + 源码映射，异常堆栈能还原到 worker.js 的真实行号
+  "observability": { "enabled": true },
+  "upload_source_maps": true,
+
+  // ★ 关键：Workers AI 绑定
+  // 写成这样即可，不需要在控制台创建任何资源、不产生额外费用
+  // （只有真正调用 env.AI.run() 时才按 token 计费）。
+  // 部署后 env.AI 就可用，对应 worker.js 里的 env.AI.run(...)。
+  "ai": {
+    "binding": "AI"
+  }
+}

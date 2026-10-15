@@ -18,7 +18,7 @@
 |---|---|
 | 运行时 | Cloudflare Workers（模块化 Worker，单文件 `worker.js`）|
 | 模型 | Workers AI：`@cf/meta/llama-3.3-70b-instruct-fp8-fast`（翻译主模型）+ `@cf/meta/llama-3.1-8b-instruct-fast`（降级备选）|
-| TTS | Workers AI：`@cf/myshell-ai/melotts`（全语种统一，含英文）|
+| TTS | Workers AI：`@cf/myshell-ai/melotts`（全语种主路径）+ `@cf/deepgram/aura-2-en`（英文降级兜底）|
 | 前端 | Tailwind CDN + Remixicon + 原生 JS（零构建）|
 | OCR | Tesseract.js v5（浏览器端，wasm）|
 
@@ -95,7 +95,9 @@ curl -X POST https://<your-worker>.workers.dev/api/tts \
 | `text` | 待合成文本，≤ 1000 字符（必填）|
 | `lang` | BCP-47 标签（`en-US` / `zh-CN` ...），取两位语种码，缺省按英文处理 |
 
-统一走 MeloTTS，返回 `audio/wav`（响应带 `no-store`，音频经读取合并后整体下发，不会出现分段拼接杂音）。英文原用 Deepgram Aura-2，实际合成音频出现拼接异常（读得很乱）已弃用；如需换回见 `worker.js` 顶部注释。
+主路径统一走 MeloTTS（返回 `audio/wav`）；melotts 不可用时，**英文自动降级** `@cf/deepgram/aura-2-en`（返回 `audio/mpeg`）。音频均经服务端读全合并后整体下发，不会出现分段拼接杂音；响应带 `no-store`。
+
+**排障**：若持续提示「语音合成失败」，把 `wrangler.jsonc` 里 `vars.TTS_DEBUG` 改为 `"1"` 重新部署，前端 toast 会显示模型真实报错（如额度不足、模型不可用），定位后改回 `"0"`。
 
 ### `GET /api/health`
 

@@ -51,10 +51,14 @@ const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 // 主模型额度耗尽 / 容量不足时的降级备选（可自行增删，需为 Workers AI 已上线模型）
 const FALLBACK_MODELS = ['@cf/meta/llama-3.1-8b-instruct-fast'];
 
-// 语音合成（TTS）模型：全语种统一走多语言 MeloTTS，处理路径只有一条、行为可预期。
-// （英文曾用 Deepgram Aura-2，实际合成音频出现拼接异常、「读得很乱」，已弃用；
-//   如想换回，把 handleTts 里的英文分支恢复、参数 { text, speaker } 即可。）
+// 语音合成（TTS）模型：
+//   主路径：全语种统一 @cf/myshell-ai/melotts，处理路径只有一条、行为可预期
+//   （注意：它的必填参数叫 prompt 不是 text，默认 lang=en；曾因传错参数整条链路 502）
+//   降级链：melotts 失败时，英文自动换 @cf/deepgram/aura-2-en（speaker=luna）
+//   （Aura-2 此前表现「读得很乱」，疑似分块流未合并所致，toAudioBytes 已支持读全合并）
 const TTS_MODEL = '@cf/myshell-ai/melotts';
+const TTS_MODEL_AURA_EN = '@cf/deepgram/aura-2-en';
+const TTS_SPEAKER_AURA = 'luna';
 const TTS_MAX_CHARS = 1000;            // 单次合成字符上限（兼顾时长与延迟）
 
 const MAX_INPUT_CHARS = 3000;      // 单次翻译字符上限（前后端一致）
@@ -547,28 +551,62 @@ async function handleTts(request, env) {
     }, 500);
   }
 
-  // lang 由前端传 BCP-47（en-US / zh-CN ...），取两位语种码喂给 MeloTTS
+  // lang 由前端传 BCP-47（en-US / zh-CN ...），取两位语种码
   const prefix = String(payload.lang || 'en-US').toLowerCase().split('-')[0] || 'en';
-  const params = { text: text, lang: prefix };
+  let lastErr = null;
 
+  // 主路径：MeloTTS 全语种。注意参数名是 prompt（不是 text）
   try {
-    const result = await env.AI.run(TTS_MODEL, params);
+    const result = await env.AI.run(TTS_MODEL, { prompt: text, lang: prefix });
     const bytes = await toAudioBytes(result);
-    if (!bytes || !bytes.length) {
-      return jsonResponse({ error: '模型没有返回音频，请稍后重试' }, 502);
+    if (bytes && bytes.length) {
+      return new Response(bytes, {
+        headers: {
+          'Content-Type': 'audio/wav',
+          'Cache-Control': 'no-store',
+          // 关掉中间层缓冲，避免音频被分段缓冲后拼接异常
+          'X-Accel-Buffering': 'no'
+        }
+      });
     }
-    return new Response(bytes, {
-      headers: {
-        'Content-Type': 'audio/wav',
-        'Cache-Control': 'no-store',
-        // 关掉中间层缓冲，避免音频被分段缓冲后拼接异常
-        'X-Accel-Buffering': 'no'
-      }
-    });
+    log('warn', 'tts_empty_audio', { model: TTS_MODEL, lang: prefix });
   } catch (err) {
-    log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL });
-    return jsonResponse({ error: '语音合成失败，请稍后重试' }, 502);
+    lastErr = err;
+    log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL, lang: prefix });
   }
+
+  // 降级：melotts 不可用（模型下线/额度/参数变更）时，英文换 Aura-2 兜底
+  if (prefix === 'en') {
+    try {
+      const result = await env.AI.run(TTS_MODEL_AURA_EN, {
+        text: text,
+        speaker: TTS_SPEAKER_AURA,
+        encoding: 'mp3',
+        container: 'none'
+      });
+      const bytes = await toAudioBytes(result);
+      if (bytes && bytes.length) {
+        return new Response(bytes, {
+          headers: {
+            'Content-Type': 'audio/mpeg',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no'
+          }
+        });
+      }
+      log('warn', 'tts_empty_audio', { model: TTS_MODEL_AURA_EN, lang: prefix });
+    } catch (err) {
+      if (!lastErr) lastErr = err;
+      log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL_AURA_EN, lang: prefix });
+    }
+  }
+
+  // TTS_DEBUG=1 时下发模型真实报错，便于排障（前端 toast 会一并显示）
+  const detail = env.TTS_DEBUG === '1' ? safeErr(lastErr) : undefined;
+  return jsonResponse(
+    { error: '语音合成失败，请稍后重试', detail: detail },
+    502
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1399,7 +1437,12 @@ const HTML = `<!DOCTYPE html>
     }).then(function (res) {
       if (!res.ok) {
         return res.json().then(function (data) {
-          throw new Error((data && data.error) || ('请求失败（HTTP ' + res.status + '）'));
+          var msg = (data && data.error) || ('请求失败（HTTP ' + res.status + '）');
+          // 排障模式下（TTS_DEBUG=1）后端会带模型真实报错，一并显示
+          if (data && data.detail && data.detail.message) {
+            msg += '（' + data.detail.message + '）';
+          }
+          throw new Error(msg);
         }, function () {
           throw new Error('请求失败（HTTP ' + res.status + '）');
         });

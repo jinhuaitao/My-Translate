@@ -6,7 +6,6 @@
  *
  * 路由：
  *   POST /api/translate       翻译接口（支持流式 SSE）
- *   POST /api/tts             语音合成接口（Workers AI TTS，返回音频流）
  *   GET  /api/health          健康检查（不调用模型，零 token 成本）
  *   GET  /manifest.json       PWA manifest
  *   GET  /sw.js               Service Worker
@@ -28,9 +27,6 @@
  *   - 新增 CSP / HSTS / COOP / X-Robots-Tag 安全响应头
  *   - 源语言缺省改为 auto；语种扩到 15 种（朗读 / OCR / 语种检测同步补齐）
  *   - 修复语种检测优先级：含日文汉字的句子不再被误判为中文
- *   - TTS 整体替换：浏览器 speechSynthesis → Workers AI TTS；
- *     英文原用 Deepgram Aura-2 出现音频拼接异常（读得很乱），
- *     现全语种统一 MeloTTS，并补 ReadableStream 读取合并与空音频防护
  *   - 前端：流式光标、debounce 定时器清理、OCR 降采样与防重复拍照、
  *           文本域高度封顶、SW 更新提示、历史面板 inert / 焦点管理
  *
@@ -48,22 +44,8 @@
 
 // 主模型：默认走 wrangler.jsonc 里 vars.MODEL，未配置时用这个
 const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-// 主模型不可用或额度不足时的降级备选（均为当前 Workers AI 在线模型）
-const FALLBACK_MODELS = [
-  '@cf/meta/llama-3.1-8b-instruct-fp8',
-  '@cf/meta/llama-4-scout-17b-16e-instruct',
-  '@cf/zai-org/glm-4.7-flash'
-];
-
-// 语音合成（TTS）模型：
-//   主路径：全语种统一 @cf/myshell-ai/melotts，处理路径只有一条、行为可预期
-//   （注意：它的必填参数叫 prompt 不是 text，默认 lang=en；曾因传错参数整条链路 502）
-//   降级链：melotts 失败时，英文自动换 @cf/deepgram/aura-2-en（speaker=luna）
-//   （Aura-2 此前表现「读得很乱」，疑似分块流未合并所致，toAudioBytes 已支持读全合并）
-const TTS_MODEL = '@cf/myshell-ai/melotts';
-const TTS_MODEL_AURA_EN = '@cf/deepgram/aura-2-en';
-const TTS_SPEAKER_AURA = 'luna';
-const TTS_MAX_CHARS = 1000;            // 单次合成字符上限（兼顾时长与延迟）
+// 主模型额度耗尽 / 容量不足时的降级备选（可自行增删，需为 Workers AI 已上线模型）
+const FALLBACK_MODELS = ['@cf/meta/llama-3.1-8b-instruct-fast'];
 
 const MAX_INPUT_CHARS = 3000;      // 单次翻译字符上限（前后端一致）
 const MAX_BODY_BYTES = 32 * 1024;  // 请求体大小闸门
@@ -71,7 +53,7 @@ const MAX_TOKENS = 4096;           // 单次生成上限
 const CONTEXT_TOKENS = 8192;       // 主模型的保守上下文窗口，用于动态压缩 max_tokens
 const RESERVED_TOKENS = 512;       // 给 system prompt 与采样余量留的缓冲
 const TEMPERATURE = 0.2;           // 翻译任务低温求稳
-const SW_VERSION = 'ai-trans-v3';
+const SW_VERSION = 'ai-trans-v2';
 const HISTORY_LIMIT = 50;
 
 // 每 IP 限流（内存态，接近精确；跨 isolate 不共享，属于第一道闸门而非硬限制）
@@ -143,11 +125,6 @@ export default {
         return jsonResponse({ error: '该接口只接受 GET' }, 405);
       }
       return healthResponse(env);
-    }
-
-    if (path === '/api/tts') {
-      if (request.method !== 'POST') return jsonResponse({ error: '该接口只接受 POST' }, 405);
-      return handleTts(request, env);
     }
 
     if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -285,14 +262,9 @@ function computeMaxTokens(text) {
 function extractText(result) {
   if (!result) return '';
   if (typeof result === 'string') return result.trim();
-  const choiceContent = result.choices
-    && result.choices[0]
-    && ((result.choices[0].message && result.choices[0].message.content)
-      || (result.choices[0].delta && result.choices[0].delta.content));
   const candidates = [
     result.response,
     result.result && result.result.response,
-    choiceContent,
     result.output_text,
     result.text
   ];
@@ -307,67 +279,19 @@ function isCapacityError(err) {
   return /neuron|quota|rate.?limit|capacity|too many requests|overload|429|503/i.test(message);
 }
 
-// 预读上游 ReadableStream 的首个数据块并包装异常捕获：
-// 1. 若模型在吐出首帧前报错，能在返回 HTTP 200 头之前被 try/catch 捕获并触发降级；
-// 2. 若流传输中途报错，转为标准错误 SSE 帧并正常结束流，避免连接异常断开导致浏览器报 Failed to fetch。
-async function wrapAiStream(upstream) {
-  const reader = upstream.getReader();
-  const first = await reader.read();
-  const enc = new TextEncoder();
-  let firstSent = false;
-
-  return new ReadableStream({
-    start(controller) {
-      if (first.done) {
-        controller.enqueue(enc.encode('data: [DONE]\n\n'));
-        controller.close();
-        return;
-      }
-      if (first.value && first.value.length) {
-        controller.enqueue(first.value);
-      }
-      firstSent = true;
-    },
-    async pull(controller) {
-      if (!firstSent) return;
-      try {
-        const step = await reader.read();
-        if (step.done) {
-          controller.close();
-          return;
-        }
-        if (step.value && step.value.length) {
-          controller.enqueue(step.value);
-        }
-      } catch (err) {
-        log('error', 'stream_pull_failed', { error: safeErr(err) });
-        const payload = JSON.stringify({ error: '流式传输中断，请稍后重试' });
-        controller.enqueue(enc.encode('data: ' + payload + '\n\n'));
-        controller.close();
-      }
-    },
-    cancel(reason) {
-      try { reader.cancel(reason); } catch (e) {}
-    }
-  });
-}
-
-// 主模型不可用（额度/容量/流初始化失败）时按顺序降级
+// 主模型不可用（额度/容量）时按顺序降级；非容量类错误直接抛出，不做无谓重试
 async function runWithFailover(env, model, params) {
-  const models = Array.from(new Set([model, DEFAULT_MODEL].concat(FALLBACK_MODELS))).filter(Boolean);
+  const models = [model].concat(FALLBACK_MODELS);
   let lastError = null;
   for (let i = 0; i < models.length; i++) {
     const m = models[i];
     try {
-      let result = await env.AI.run(m, params);
-      if (params && params.stream && result && typeof result.getReader === 'function') {
-        result = await wrapAiStream(result);
-      }
+      const result = await env.AI.run(m, params);
       return { model: m, result: result };
     } catch (err) {
       lastError = err;
       const hasNext = i < models.length - 1;
-      if (!hasNext) throw err;
+      if (!hasNext || !isCapacityError(err)) throw err;
       log('warn', 'model_unavailable_try_fallback', {
         model: m, next: models[i + 1], error: safeErr(err)
       });
@@ -393,28 +317,13 @@ function textToSseStream(text) {
   });
 }
 
-function errorToSseStream(message) {
-  const enc = new TextEncoder();
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(enc.encode('data: ' + JSON.stringify({ error: String(message) }) + '\n\n'));
-      controller.enqueue(enc.encode('data: [DONE]\n\n'));
-      controller.close();
-    }
-  });
-}
-
 function sseResponse(upstream) {
   let body = upstream;
   if (typeof upstream === 'string') {
     body = textToSseStream(upstream);
-  } else if (upstream && typeof upstream === 'object' && typeof upstream.getReader !== 'function') {
-    const extracted = extractText(upstream);
-    body = extracted
-      ? textToSseStream(extracted)
-      : errorToSseStream('模型返回了无法识别的流式响应');
   } else if (!upstream || typeof upstream.getReader !== 'function') {
-    body = errorToSseStream('模型返回了无法识别的流式响应');
+    // 上游返回了既不是流也不是文本的东西：转成一条错误 SSE，前端直接弹提示而不是挂起
+    body = textToSseStream(JSON.stringify({ error: '模型返回了无法识别的流式响应' }));
   }
   return new Response(body, {
     headers: {
@@ -486,16 +395,9 @@ async function handleTranslate(request, env) {
 
   try {
     if (wantStream) {
-      try {
-        const run = await runWithFailover(env, model, Object.assign({ stream: true }, params));
-        return sseResponse(run.result);
-      } catch (streamErr) {
-        log('warn', 'stream_failed_fallback_to_non_stream', { error: safeErr(streamErr) });
-        const run = await runWithFailover(env, model, params);
-        const translated = extractText(run.result);
-        if (!translated) throw streamErr;
-        return sseResponse(translated);
-      }
+      // 流式：只有在「还没开始吐字」前失败才能降级；一旦 upstream 返回就只能透传
+      const run = await runWithFailover(env, model, Object.assign({ stream: true }, params));
+      return sseResponse(run.result);
     }
 
     const run = await runWithFailover(env, model, params);
@@ -532,160 +434,6 @@ function healthResponse(env) {
     max_input_chars: MAX_INPUT_CHARS,
     rate_limit: { window_ms: RATE_LIMIT.WINDOW_MS, max_requests: RATE_LIMIT.MAX_REQUESTS }
   }, 200);
-}
-
-/* ------------------------------------------------------------------ */
-/* 语音合成（TTS）                                                      */
-/* ------------------------------------------------------------------ */
-
-// Workers AI 各 TTS 模型的返回结构不一：可能是 Uint8Array / ArrayBuffer /
-// Response-like / base64 字符串 / { audio: base64 }，这里统一成 Uint8Array
-async function toAudioBytes(result) {
-  if (!result) return null;
-  if (result instanceof Uint8Array) return result;
-  if (result instanceof ArrayBuffer) return new Uint8Array(result);
-  if (typeof result === 'string') return base64ToBytes(result);
-  if (typeof result.getReader === 'function') {
-    // 上游返回分块流：必须读完整并拼接成单段音频再下发。
-    // 若把流直接透传而不处理，前端拿到的可能是「多个音频分段」，
-    // 播放出来就是片段反复/杂音，即「读得很乱」。
-    const reader = result.getReader();
-    const chunks = [];
-    let total = 0;
-    for (;;) {
-      const step = await reader.read();
-      if (step.done) break;
-      if (step.value && step.value.length) {
-        chunks.push(step.value);
-        total += step.value.length;
-      }
-    }
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (let i = 0; i < chunks.length; i++) {
-      out.set(chunks[i], offset);
-      offset += chunks[i].length;
-    }
-    return total ? out : null;
-  }
-  if (typeof result.arrayBuffer === 'function') {
-    return new Uint8Array(await result.arrayBuffer()); // Response-like
-  }
-  if (result.audio) {
-    if (typeof result.audio === 'string') return base64ToBytes(result.audio);
-    if (result.audio instanceof Uint8Array) return result.audio;
-  }
-  return null;
-}
-
-function base64ToBytes(b64) {
-  try {
-    const bin = atob(b64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  } catch (e) { return null; }
-}
-
-async function handleTts(request, env) {
-  // 与翻译接口一致的限流与请求体防护
-  const limit = checkRateLimit(getClientIp(request));
-  if (!limit.ok) {
-    return jsonResponse({ error: '请求过于频繁，请稍后再试' }, 429, {
-      'Retry-After': String(limit.retryAfter)
-    });
-  }
-
-  let rawBody;
-  try {
-    rawBody = await request.text();
-  } catch (e) {
-    return jsonResponse({ error: '无法读取请求体' }, 400);
-  }
-  if (rawBody.length > MAX_BODY_BYTES) {
-    return jsonResponse({ error: '请求体过大（上限 ' + MAX_BODY_BYTES + ' 字节）' }, 413);
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch (e) {
-    return jsonResponse({ error: '请求体必须是合法的 JSON' }, 400);
-  }
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return jsonResponse({ error: '请求体格式不正确' }, 400);
-  }
-
-  const text = typeof payload.text === 'string' ? payload.text.trim() : '';
-  if (!text) return jsonResponse({ error: '内容不能为空' }, 400);
-  if (text.length > TTS_MAX_CHARS) {
-    return jsonResponse({
-      error: '文本过长：朗读最多 ' + TTS_MAX_CHARS + ' 个字符，当前 ' + text.length + ' 个'
-    }, 400);
-  }
-
-  if (!env.AI || typeof env.AI.run !== 'function') {
-    return jsonResponse({
-      error: '未绑定 Workers AI：请在 wrangler.jsonc 中声明 "ai": { "binding": "AI" }'
-    }, 500);
-  }
-
-  // lang 由前端传 BCP-47（en-US / zh-CN ...），取两位语种码
-  const prefix = String(payload.lang || 'en-US').toLowerCase().split('-')[0] || 'en';
-  let lastErr = null;
-
-  // 主路径：MeloTTS 全语种。注意参数名是 prompt（不是 text）
-  try {
-    const result = await env.AI.run(TTS_MODEL, { prompt: text, lang: prefix });
-    const bytes = await toAudioBytes(result);
-    if (bytes && bytes.length) {
-      return new Response(bytes, {
-        headers: {
-          'Content-Type': 'audio/wav',
-          'Cache-Control': 'no-store',
-          // 关掉中间层缓冲，避免音频被分段缓冲后拼接异常
-          'X-Accel-Buffering': 'no'
-        }
-      });
-    }
-    log('warn', 'tts_empty_audio', { model: TTS_MODEL, lang: prefix });
-  } catch (err) {
-    lastErr = err;
-    log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL, lang: prefix });
-  }
-
-  // 降级：melotts 不可用（模型下线/额度/参数变更）时，英文换 Aura-2 兜底
-  if (prefix === 'en') {
-    try {
-      const result = await env.AI.run(TTS_MODEL_AURA_EN, {
-        text: text,
-        speaker: TTS_SPEAKER_AURA,
-        encoding: 'mp3',
-        container: 'none'
-      });
-      const bytes = await toAudioBytes(result);
-      if (bytes && bytes.length) {
-        return new Response(bytes, {
-          headers: {
-            'Content-Type': 'audio/mpeg',
-            'Cache-Control': 'no-store',
-            'X-Accel-Buffering': 'no'
-          }
-        });
-      }
-      log('warn', 'tts_empty_audio', { model: TTS_MODEL_AURA_EN, lang: prefix });
-    } catch (err) {
-      if (!lastErr) lastErr = err;
-      log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL_AURA_EN, lang: prefix });
-    }
-  }
-
-  // TTS_DEBUG=1 时下发模型真实报错，便于排障（前端 toast 会一并显示）
-  const detail = env.TTS_DEBUG === '1' ? safeErr(lastErr) : undefined;
-  return jsonResponse(
-    { error: '语音合成失败，请稍后重试', detail: detail },
-    502
-  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1210,56 +958,9 @@ const HTML = `<!DOCTYPE html>
       var obj;
       try { obj = JSON.parse(payload); } catch (e) { continue; }
       if (obj && obj.error) throw new Error(String(obj.error));
-      var piece = (obj && typeof obj.response === 'string')
-        ? obj.response
-        : (obj && obj.choices && obj.choices[0] && obj.choices[0].delta && typeof obj.choices[0].delta.content === 'string'
-          ? obj.choices[0].delta.content
-          : null);
-      if (piece !== null) onPiece(piece);
+      if (obj && typeof obj.response === 'string') onPiece(obj.response);
     }
     return rest;
-  }
-
-  function fallbackNonStreamTranslate(text, signal, mySeq, stopCaret) {
-    return fetch('/api/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: signal,
-      body: JSON.stringify({
-        text: text,
-        source_lang: els.source.value,
-        target_lang: els.target.value,
-        stream: false
-      })
-    }).then(function (res) {
-      if (!res.ok) {
-        return readErrorResponse(res).then(function (msg) {
-          throw new Error(msg);
-        });
-      }
-      return res.json();
-    }).then(function (data) {
-      if (mySeq !== seq) return;
-      stopCaret();
-      var finalText = ((data && data.translated_text) || '').trim();
-      if (!finalText) { setOutput(''); showToast('模型没有返回内容，请重试'); return; }
-      setOutput(finalText);
-      saveToHistory(text, finalText);
-    });
-  }
-
-  function formatFetchError(err) {
-    var msg = (err && err.message) ? String(err.message) : '网络异常';
-    if (/failed to fetch|load failed|networkerror/i.test(msg)) {
-      if (location.protocol === 'file:') {
-        return '请通过 Worker 地址访问，不能直接双击打开 HTML';
-      }
-      if (/\.workers\.dev$/i.test(location.hostname)) {
-        return '网络无法连接 workers.dev（建议绑定自定义域名或检查网络代理）';
-      }
-      return '无法连接后端服务（请确认 Worker 正在运行且网络正常）';
-    }
-    return msg;
   }
 
   function doTranslate() {
@@ -1343,20 +1044,7 @@ const HTML = `<!DOCTYPE html>
       if (mySeq !== seq) return;
       stopCaret();
       var offline = typeof navigator !== 'undefined' && navigator.onLine === false;
-      if (offline) {
-        showToast('当前处于离线状态');
-        return;
-      }
-      // 若流式传输在网络层或首包阶段中断（未产出任何译文），自动回退一次非流式请求
-      if (!acc.trim() && /failed to fetch|load failed|networkerror/i.test(String((err && err.message) || ''))) {
-        return fallbackNonStreamTranslate(text, signal, mySeq, stopCaret).catch(function (err2) {
-          if (err2 && err2.name === 'AbortError') return;
-          if (mySeq !== seq) return;
-          stopCaret();
-          showToast('翻译失败：' + formatFetchError(err2));
-        });
-      }
-      showToast('翻译失败：' + formatFetchError(err));
+      showToast(offline ? '当前处于离线状态' : ('翻译失败：' + ((err && err.message) || '网络异常')));
     }).then(function () {
       if (mySeq !== seq) return;
       busy = false;
@@ -1528,30 +1216,20 @@ const HTML = `<!DOCTYPE html>
     speakingBtn = null;
   }
 
-  /* ---------- 朗读（Workers AI TTS：英文 Deepgram Aura-2 / 其他 MeloTTS） ---------- */
-
-  var audioEl = null;
-
-  function stopSpeaking() {
-    if (audioEl) {
-      try { audioEl.pause(); } catch (e) {}
-      try { if (audioEl.src) URL.revokeObjectURL(audioEl.src); } catch (e) {}
-      audioEl = null;
-    }
-    resetSpeaking();
-  }
-
   function speak(type) {
+    if (!('speechSynthesis' in window)) { showToast('当前浏览器不支持朗读'); return; }
+
     var btn = $(type === 'source' ? 'btnSpeakSource' : 'btnSpeakTarget');
     var wasSpeaking = btn === speakingBtn;
 
-    stopSpeaking(); // 再点一次 = 停止当前朗读
+    window.speechSynthesis.cancel();
+    resetSpeaking();
     if (wasSpeaking) return;
 
     var text = type === 'source' ? els.input.value.trim() : els.output.textContent.trim();
     if (!text) { showToast(type === 'source' ? '没有可朗读的原文' : '还没有译文'); return; }
 
-    var SPEECH_LIMIT = 1000; // 与服务端 TTS_MAX_CHARS 保持一致
+    var SPEECH_LIMIT = 3000;
     if (text.length > SPEECH_LIMIT) {
       showToast('文本较长，仅朗读前 ' + SPEECH_LIMIT + ' 个字符');
       text = text.slice(0, SPEECH_LIMIT);
@@ -1560,53 +1238,19 @@ const HTML = `<!DOCTYPE html>
     var langKey = type === 'source' ? els.source.value : els.target.value;
     var lang = langKey === 'auto' ? guessSpeechLang(text) : (SPEECH_LANG[langKey] || 'en-US');
 
-    // 先进入「朗读中」视觉状态，请求或播放失败时再复位
-    speakingBtn = btn;
+    var utter = new SpeechSynthesisUtterance(text);
+    utter.lang = lang;
+    utter.onend = resetSpeaking;
+    utter.onerror = resetSpeaking;
+
     var icon = btn.querySelector('i');
     if (icon) {
       icon.classList.remove('ri-volume-up-line');
       icon.classList.add('ri-volume-up-fill');
     }
     btn.classList.add('speaking');
-
-    fetch('/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, lang: lang })
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().then(function (data) {
-          var msg = (data && data.error) || ('请求失败（HTTP ' + res.status + '）');
-          // 排障模式下（TTS_DEBUG=1）后端会带模型真实报错，一并显示
-          if (data && data.detail && data.detail.message) {
-            msg += '（' + data.detail.message + '）';
-          }
-          throw new Error(msg);
-        }, function () {
-          throw new Error('请求失败（HTTP ' + res.status + '）');
-        });
-      }
-      var ct = res.headers.get('content-type') || '';
-      if (ct.indexOf('audio/') !== 0) throw new Error('服务端返回了非音频内容');
-      return res.blob();
-    }).then(function (blob) {
-      // 空 blob / 异常小的数据多半是模型返回损坏，直接提示而不是播放出杂音
-      if (!blob || blob.size < 64) {
-        stopSpeaking();
-        showToast('音频数据异常，请重试');
-        return;
-      }
-      audioEl = new Audio(URL.createObjectURL(blob));
-      audioEl.onended = stopSpeaking;
-      audioEl.onerror = function () { stopSpeaking(); showToast('播放失败，请重试'); };
-      var p = audioEl.play();
-      if (p && p.catch) {
-        p.catch(function () { stopSpeaking(); showToast('播放失败：浏览器阻止了自动播放'); });
-      }
-    }).catch(function (err) {
-      stopSpeaking();
-      showToast('朗读失败：' + ((err && err.message) || '请稍后重试'));
-    });
+    speakingBtn = btn;
+    window.speechSynthesis.speak(utter);
   }
 
   function legacyCopy(text) {
@@ -1803,7 +1447,7 @@ const HTML = `<!DOCTYPE html>
   });
 
   window.addEventListener('beforeunload', function () {
-    stopSpeaking(); // 离开页面时停止正在播放的合成音频
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   });
 
   function updateNetBadge() {

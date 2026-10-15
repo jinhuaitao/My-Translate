@@ -47,13 +47,6 @@ const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 // 主模型额度耗尽 / 容量不足时的降级备选（可自行增删，需为 Workers AI 已上线模型）
 const FALLBACK_MODELS = ['@cf/meta/llama-3.1-8b-instruct-fast'];
 
-// 语音合成（TTS）模型：英文走 Deepgram Aura-2（音质好、延迟低），
-// 其他语言走多语言 MeloTTS。均按需计费，不合成不花钱。
-const TTS_MODEL_EN = '@cf/deepgram/aura-2-en';
-const TTS_MODEL_MULTI = '@cf/myshell-ai/melotts';
-const TTS_SPEAKER_EN = 'asteria';      // Aura-2 英文音色：asteria/luna/stella/athena/hera/orion 等
-const TTS_MAX_CHARS = 1000;            // 单次合成字符上限（兼顾时长与延迟）
-
 const MAX_INPUT_CHARS = 3000;      // 单次翻译字符上限（前后端一致）
 const MAX_BODY_BYTES = 32 * 1024;  // 请求体大小闸门
 const MAX_TOKENS = 4096;           // 单次生成上限

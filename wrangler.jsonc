@@ -34,6 +34,10 @@
   // 运行时变量：换模型只改这里 + 重新部署，worker.js 不用动。
   // 留空字符串时 worker.js 会回退到内置的 DEFAULT_MODEL。
   "vars": {
-    "MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    "MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+
+    // 排障开关：设为 "1" 后，/api/tts 失败时响应会附带模型真实报错（detail 字段），
+    // 前端 toast 同步显示，便于定位「语音合成失败」的具体原因；排查完建议改回 "0"。
+    "TTS_DEBUG": "0"
   }
 }

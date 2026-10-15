@@ -6,7 +6,6 @@
  *
  * 路由：
  *   POST /api/translate       翻译接口（支持流式 SSE）
- *   POST /api/tts             语音合成接口（Workers AI TTS，返回音频流）
  *   GET  /api/health          健康检查（不调用模型，零 token 成本）
  *   GET  /manifest.json       PWA manifest
  *   GET  /sw.js               Service Worker
@@ -28,9 +27,6 @@
  *   - 新增 CSP / HSTS / COOP / X-Robots-Tag 安全响应头
  *   - 源语言缺省改为 auto；语种扩到 15 种（朗读 / OCR / 语种检测同步补齐）
  *   - 修复语种检测优先级：含日文汉字的句子不再被误判为中文
- *   - TTS 整体替换：浏览器 speechSynthesis → Workers AI（英文 Deepgram Aura-2、
- *     其他语言 MeloTTS），前端改 Audio 播放；彻底摆脱「系统语音包缺失/默认中文音
- *     读英文」问题
  *   - 前端：流式光标、debounce 定时器清理、OCR 降采样与防重复拍照、
  *           文本域高度封顶、SW 更新提示、历史面板 inert / 焦点管理
  *
@@ -136,11 +132,6 @@ export default {
         return jsonResponse({ error: '该接口只接受 GET' }, 405);
       }
       return healthResponse(env);
-    }
-
-    if (path === '/api/tts') {
-      if (request.method !== 'POST') return jsonResponse({ error: '该接口只接受 POST' }, 405);
-      return handleTts(request, env);
     }
 
     if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -450,111 +441,6 @@ function healthResponse(env) {
     max_input_chars: MAX_INPUT_CHARS,
     rate_limit: { window_ms: RATE_LIMIT.WINDOW_MS, max_requests: RATE_LIMIT.MAX_REQUESTS }
   }, 200);
-}
-
-/* ------------------------------------------------------------------ */
-/* 语音合成（TTS）                                                      */
-/* ------------------------------------------------------------------ */
-
-// Workers AI 各 TTS 模型的返回结构不一：可能是 Uint8Array / ArrayBuffer /
-// Response-like / base64 字符串 / { audio: base64 }，这里统一成 Uint8Array
-async function toAudioBytes(result) {
-  if (!result) return null;
-  if (result instanceof Uint8Array) return result;
-  if (result instanceof ArrayBuffer) return new Uint8Array(result);
-  if (typeof result === 'string') return base64ToBytes(result);
-  if (typeof result.arrayBuffer === 'function') {
-    return new Uint8Array(await result.arrayBuffer()); // Response-like
-  }
-  if (result.audio) {
-    if (typeof result.audio === 'string') return base64ToBytes(result.audio);
-    if (result.audio instanceof Uint8Array) return result.audio;
-  }
-  return null;
-}
-
-function base64ToBytes(b64) {
-  try {
-    const bin = atob(b64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  } catch (e) { return null; }
-}
-
-async function handleTts(request, env) {
-  // 与翻译接口一致的限流与请求体防护
-  const limit = checkRateLimit(getClientIp(request));
-  if (!limit.ok) {
-    return jsonResponse({ error: '请求过于频繁，请稍后再试' }, 429, {
-      'Retry-After': String(limit.retryAfter)
-    });
-  }
-
-  let rawBody;
-  try {
-    rawBody = await request.text();
-  } catch (e) {
-    return jsonResponse({ error: '无法读取请求体' }, 400);
-  }
-  if (rawBody.length > MAX_BODY_BYTES) {
-    return jsonResponse({ error: '请求体过大（上限 ' + MAX_BODY_BYTES + ' 字节）' }, 413);
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch (e) {
-    return jsonResponse({ error: '请求体必须是合法的 JSON' }, 400);
-  }
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return jsonResponse({ error: '请求体格式不正确' }, 400);
-  }
-
-  const text = typeof payload.text === 'string' ? payload.text.trim() : '';
-  if (!text) return jsonResponse({ error: '内容不能为空' }, 400);
-  if (text.length > TTS_MAX_CHARS) {
-    return jsonResponse({
-      error: '文本过长：朗读最多 ' + TTS_MAX_CHARS + ' 个字符，当前 ' + text.length + ' 个'
-    }, 400);
-  }
-
-  if (!env.AI || typeof env.AI.run !== 'function') {
-    return jsonResponse({
-      error: '未绑定 Workers AI：请在 wrangler.jsonc 中声明 "ai": { "binding": "AI" }'
-    }, 500);
-  }
-
-  // lang 由前端传 BCP-47（en-US / zh-CN ...），按前缀分流：
-  // 英文走 Deepgram Aura-2（音质好），其余走多语言 MeloTTS
-  const prefix = String(payload.lang || 'en-US').toLowerCase().split('-')[0] || 'en';
-  let model, params, mime;
-  if (prefix === 'en') {
-    model = TTS_MODEL_EN;
-    params = { text: text, speaker: TTS_SPEAKER_EN };
-    mime = 'audio/mpeg';
-  } else {
-    model = TTS_MODEL_MULTI;
-    params = { text: text, lang: prefix };
-    mime = 'audio/wav';
-  }
-
-  try {
-    const result = await env.AI.run(model, params);
-    const bytes = await toAudioBytes(result);
-    if (!bytes || !bytes.length) {
-      return jsonResponse({ error: '模型没有返回音频，请稍后重试' }, 502);
-    }
-    return new Response(bytes, {
-      headers: {
-        'Content-Type': mime,
-        'Cache-Control': 'no-store'
-      }
-    });
-  } catch (err) {
-    log('error', 'tts_failed', { error: safeErr(err), model: model });
-    return jsonResponse({ error: '语音合成失败，请稍后重试' }, 502);
-  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1337,30 +1223,52 @@ const HTML = `<!DOCTYPE html>
     speakingBtn = null;
   }
 
-  /* ---------- 朗读（Workers AI TTS：英文 Deepgram Aura-2 / 其他 MeloTTS） ---------- */
+  /* ---------- 语音列表（Chrome 异步加载，Safari 同步） ---------- */
 
-  var audioEl = null;
+  var voicesCache = [];
 
-  function stopSpeaking() {
-    if (audioEl) {
-      try { audioEl.pause(); } catch (e) {}
-      try { if (audioEl.src) URL.revokeObjectURL(audioEl.src); } catch (e) {}
-      audioEl = null;
+  function loadVoices() {
+    try {
+      voicesCache = window.speechSynthesis.getVoices() || [];
+    } catch (e) { voicesCache = []; }
+  }
+
+  function normalizeLang(l) {
+    return String(l || '').toLowerCase().replace('_', '-');
+  }
+
+  // 显式挑音色：只设 utter.lang 时，Safari / 部分 Chrome 会用系统默认音（常见为中文）
+  // 去读英文，表现为「读英文有问题、中文没问题」；这里按 BCP-47 精确匹配再退到同语族。
+  function pickVoice(lang) {
+    if (!voicesCache.length) loadVoices();
+    if (!voicesCache.length) return null;
+    var want = normalizeLang(lang);
+    var prefix = want.split('-')[0];
+    var exact = null, sameFamily = null;
+    for (var i = 0; i < voicesCache.length; i++) {
+      var v = voicesCache[i];
+      var vl = normalizeLang(v && v.lang);
+      if (!vl) continue;
+      if (vl === want) { exact = v; break; }
+      if (!sameFamily && vl.split('-')[0] === prefix) sameFamily = v;
     }
-    resetSpeaking();
+    return exact || sameFamily;
   }
 
   function speak(type) {
+    if (!('speechSynthesis' in window)) { showToast('当前浏览器不支持朗读'); return; }
+
     var btn = $(type === 'source' ? 'btnSpeakSource' : 'btnSpeakTarget');
     var wasSpeaking = btn === speakingBtn;
 
-    stopSpeaking(); // 再点一次 = 停止当前朗读
+    window.speechSynthesis.cancel();
+    resetSpeaking();
     if (wasSpeaking) return;
 
     var text = type === 'source' ? els.input.value.trim() : els.output.textContent.trim();
     if (!text) { showToast(type === 'source' ? '没有可朗读的原文' : '还没有译文'); return; }
 
-    var SPEECH_LIMIT = 1000; // 与服务端 TTS_MAX_CHARS 保持一致
+    var SPEECH_LIMIT = 3000;
     if (text.length > SPEECH_LIMIT) {
       showToast('文本较长，仅朗读前 ' + SPEECH_LIMIT + ' 个字符');
       text = text.slice(0, SPEECH_LIMIT);
@@ -1369,42 +1277,26 @@ const HTML = `<!DOCTYPE html>
     var langKey = type === 'source' ? els.source.value : els.target.value;
     var lang = langKey === 'auto' ? guessSpeechLang(text) : (SPEECH_LANG[langKey] || 'en-US');
 
-    // 先进入「朗读中」视觉状态，请求或播放失败时再复位
-    speakingBtn = btn;
+    var utter = new SpeechSynthesisUtterance(text);
+    utter.lang = lang;
+    var voice = pickVoice(lang);
+    if (voice) {
+      utter.voice = voice;
+    } else if (langKey !== 'auto' && normalizeLang(lang).split('-')[0] !== 'zh') {
+      // 没找到匹配音色：多半是系统没装对应语言语音包，明确告知而不是继续用中文音硬读
+      showToast('系统缺少该语言的语音包，请在系统设置中下载后重试');
+    }
+    utter.onend = resetSpeaking;
+    utter.onerror = resetSpeaking;
+
     var icon = btn.querySelector('i');
     if (icon) {
       icon.classList.remove('ri-volume-up-line');
       icon.classList.add('ri-volume-up-fill');
     }
     btn.classList.add('speaking');
-
-    fetch('/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, lang: lang })
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().then(function (data) {
-          throw new Error((data && data.error) || ('请求失败（HTTP ' + res.status + '）'));
-        }, function () {
-          throw new Error('请求失败（HTTP ' + res.status + '）');
-        });
-      }
-      var ct = res.headers.get('content-type') || '';
-      if (ct.indexOf('audio/') !== 0) throw new Error('服务端返回了非音频内容');
-      return res.blob();
-    }).then(function (blob) {
-      audioEl = new Audio(URL.createObjectURL(blob));
-      audioEl.onended = stopSpeaking;
-      audioEl.onerror = function () { stopSpeaking(); showToast('播放失败，请重试'); };
-      var p = audioEl.play();
-      if (p && p.catch) {
-        p.catch(function () { stopSpeaking(); showToast('播放失败：浏览器阻止了自动播放'); });
-      }
-    }).catch(function (err) {
-      stopSpeaking();
-      showToast('朗读失败：' + ((err && err.message) || '请稍后重试'));
-    });
+    speakingBtn = btn;
+    window.speechSynthesis.speak(utter);
   }
 
   function legacyCopy(text) {
@@ -1601,8 +1493,19 @@ const HTML = `<!DOCTYPE html>
   });
 
   window.addEventListener('beforeunload', function () {
-    stopSpeaking(); // 离开页面时停止正在播放的合成音频
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   });
+
+  // Chrome 首屏 getVoices() 为空、靠 voiceschanged 异步回调；提前加载并在变更时刷新缓存，
+  // 否则第一次点朗读时 voicesCache 还是空的，匹配不到音色
+  if ('speechSynthesis' in window) {
+    loadVoices();
+    if (window.speechSynthesis.addEventListener) {
+      window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    } else {
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+    }
+  }
 
   function updateNetBadge() {
     els.netBadge.classList.toggle('hidden', navigator.onLine !== false);

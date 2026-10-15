@@ -18,7 +18,7 @@
 |---|---|
 | 运行时 | Cloudflare Workers（模块化 Worker，单文件 `worker.js`）|
 | 模型 | Workers AI：`@cf/meta/llama-3.3-70b-instruct-fp8-fast`（翻译主模型）+ `@cf/meta/llama-3.1-8b-instruct-fast`（降级备选）|
-| TTS | Workers AI：`@cf/deepgram/aura-2-en`（英文）+ `@cf/myshell-ai/melotts`（多语言）|
+| TTS | Workers AI：`@cf/myshell-ai/melotts`（全语种统一，含英文）|
 | 前端 | Tailwind CDN + Remixicon + 原生 JS（零构建）|
 | OCR | Tesseract.js v5（浏览器端，wasm）|
 
@@ -93,9 +93,9 @@ curl -X POST https://<your-worker>.workers.dev/api/tts \
 | 字段 | 说明 |
 |---|---|
 | `text` | 待合成文本，≤ 1000 字符（必填）|
-| `lang` | BCP-47 标签（`en-US` / `zh-CN` ...），缺省按英文处理 |
+| `lang` | BCP-47 标签（`en-US` / `zh-CN` ...），取两位语种码，缺省按英文处理 |
 
-按语言前缀自动分流：英文返回 `audio/mpeg`（Deepgram Aura-2），其他语言返回 `audio/wav`（MeloTTS）。响应 `no-store`。
+统一走 MeloTTS，返回 `audio/wav`（响应带 `no-store`，音频经读取合并后整体下发，不会出现分段拼接杂音）。英文原用 Deepgram Aura-2，实际合成音频出现拼接异常（读得很乱）已弃用；如需换回见 `worker.js` 顶部注释。
 
 ### `GET /api/health`
 
@@ -133,7 +133,7 @@ Translate/
 - 新增限流、请求体闸门、模型故障转移、动态 max_tokens
 - 新增 CSP/HSTS/COOP 安全响应头，错误响应不再泄漏内部细节
 - 语言扩充至 14 种；新增 `/api/health`、`/api/tts`、`/favicon.ico`
-- **TTS 整体替换**：浏览器 speechSynthesis → Workers AI（英文 Deepgram Aura-2 / 其他 MeloTTS），解决「系统语音包缺失、默认中文音读英文」问题
+- **TTS 整体替换**：浏览器 speechSynthesis → Workers AI TTS，解决「系统语音包缺失、默认中文音读英文」问题；英文先后试用 Deepgram Aura-2（音频拼接异常、读得乱）后弃用，现全语种统一 MeloTTS，并补 ReadableStream 读全合并 + 空音频防护
 - 流式光标、OCR 降采样与防重复拍照、历史面板 inert/焦点管理
 - 修复日文汉字被误判为中文的朗读语种 bug
 

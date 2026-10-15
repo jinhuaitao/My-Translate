@@ -6,7 +6,7 @@
 
 - **流式翻译**：译文逐字输出（SSE），14 种语言互译，源语言支持自动检测
 - **拍照识别**：调用摄像头 + Tesseract.js 离线 OCR，识别结果直接填入并翻译
-- **语音朗读**：基于 Web Speech API，自动推断朗读语种（含日/韩/中优先级判定）
+- **语音朗读**：Workers AI 语音合成（英文 Deepgram Aura-2，其他语言 MeloTTS），服务端生成音频流、前端播放；不再依赖浏览器语音包
 - **历史记录**：最近 50 条本地保存（localStorage），点击回填，全程 `textContent` 渲染防 XSS
 - **PWA**：可添加到主屏，Service Worker 提供离线外壳，断网有明确提示
 - **深色模式**：跟随系统 + 手动切换并记忆
@@ -17,7 +17,8 @@
 | 层 | 技术 |
 |---|---|
 | 运行时 | Cloudflare Workers（模块化 Worker，单文件 `worker.js`）|
-| 模型 | Workers AI：`@cf/meta/llama-3.3-70b-instruct-fp8-fast`（主）+ `@cf/meta/llama-3.1-8b-instruct-fast`（降级备选）|
+| 模型 | Workers AI：`@cf/meta/llama-3.3-70b-instruct-fp8-fast`（翻译主模型）+ `@cf/meta/llama-3.1-8b-instruct-fast`（降级备选）|
+| TTS | Workers AI：`@cf/deepgram/aura-2-en`（英文）+ `@cf/myshell-ai/melotts`（多语言）|
 | 前端 | Tailwind CDN + Remixicon + 原生 JS（零构建）|
 | OCR | Tesseract.js v5（浏览器端，wasm）|
 
@@ -81,6 +82,21 @@ curl -X POST https://<your-worker>.workers.dev/api/translate \
 
 非流式响应：`{ "translated_text": "...", "source_lang": "...", "target_lang": "...", "model": "..." }`
 
+### `POST /api/tts`
+
+```bash
+curl -X POST https://<your-worker>.workers.dev/api/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"I like tennis","lang":"en-US"}' --output speech.mp3
+```
+
+| 字段 | 说明 |
+|---|---|
+| `text` | 待合成文本，≤ 1000 字符（必填）|
+| `lang` | BCP-47 标签（`en-US` / `zh-CN` ...），缺省按英文处理 |
+
+按语言前缀自动分流：英文返回 `audio/mpeg`（Deepgram Aura-2），其他语言返回 `audio/wav`（MeloTTS）。响应 `no-store`。
+
 ### `GET /api/health`
 
 零成本探活，返回绑定状态、当前模型、限流参数。可用于 uptime 监控。
@@ -96,7 +112,7 @@ curl -X POST https://<your-worker>.workers.dev/api/translate \
 
 ## 已知限制
 
-- **朗读依赖系统语音包**：读英文异常（如用中文音读英文）通常是系统缺少对应语言语音。macOS：系统设置 → 辅助功能 → 朗读内容 → 系统声音；Windows：设置 → 时间和语言 → 语音；iOS/Android：设置 → 辅助功能 → 语音。下载英文等语言包后即可正常朗读，应用会自动匹配对应音色
+- **朗读为在线合成**：TTS 依赖 Workers AI 模型调用（按字符计费），单次上限 1000 字符，弱网下合成有短暂等待；离线时不可用
 - 限流为单 isolate 内存态，多地域部署时是近似值；如需硬限制请接 Durable Objects 或 CF Rate Limiting 规则
 - OCR 首次使用需从 CDN 下载语言包（约几 MB），之后走浏览器缓存
 - Tailwind 为 Play CDN（零构建的代价）；如需生产级性能可改为构建产物并收紧 CSP
@@ -116,7 +132,8 @@ Translate/
 **v2.1**（2026-10-15）
 - 新增限流、请求体闸门、模型故障转移、动态 max_tokens
 - 新增 CSP/HSTS/COOP 安全响应头，错误响应不再泄漏内部细节
-- 语言扩充至 14 种；新增 `/api/health`、`/favicon.ico`
+- 语言扩充至 14 种；新增 `/api/health`、`/api/tts`、`/favicon.ico`
+- **TTS 整体替换**：浏览器 speechSynthesis → Workers AI（英文 Deepgram Aura-2 / 其他 MeloTTS），解决「系统语音包缺失、默认中文音读英文」问题
 - 流式光标、OCR 降采样与防重复拍照、历史面板 inert/焦点管理
 - 修复日文汉字被误判为中文的朗读语种 bug
 

@@ -238,14 +238,13 @@ function buildMessages(text, source, target) {
   const sourceName = source === 'auto' ? null : (LANG_NAMES[source] || LANG_NAMES.english);
 
   const lines = [
-    'You are a strict, professional translation-only engine. Your ONLY job is translation.',
-    sourceName ? 'Source language: ' + sourceName + '.' : 'Auto-detect source language.',
-    'CRITICAL RULES:',
-    '1. Translate the exact user input into ' + targetName + '. NEVER generate code, NEVER write scripts, NEVER act as an assistant or programmer, even if the input looks like code, file names, or programming commands.',
-    '2. Output ONLY the translated text. Do NOT add titles, headings (#), explanations, markdown code blocks (like ```), or introductory phrases.',
-    '3. If the target language is Chinese, use proper Chinese characters (汉字) and NO Pinyin.',
-    '4. Preserve original line breaks, formatting, and keep numbers or file names unchanged if they are part of the text.'
+    'You are a direct translation tool. Translate the text below into ' + targetName + '.',
+    'Provide ONLY the direct translation. Do not answer questions, do not chat, do not refuse, do not output explanations.'
   ];
+
+  if (sourceName) {
+    lines.push('Source language: ' + sourceName + '.');
+  }
 
   return [
     { role: 'system', content: lines.join('\n') },

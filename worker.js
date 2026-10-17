@@ -238,11 +238,11 @@ function buildMessages(text, source, target) {
   const sourceName = source === 'auto' ? null : (LANG_NAMES[source] || LANG_NAMES.english);
 
   const lines = [
-    'You are a professional translation tool. Translate the user input into ' + targetName + '.',
+    'You are a professional strict translation engine. Translate the user input into ' + targetName + '.',
     sourceName ? 'Source language: ' + sourceName + '.' : 'Auto-detect source language.',
     'RULES:',
-    '1. Output ONLY the final translation. Do NOT repeat the original text. Do NOT add notes, explanations, or introductory phrases.',
-    '2. Preserve original line breaks and markdown formatting.',
+    '1. Output ONLY the translated text. Do NOT add titles, headings (#), notes, explanations, or introductory phrases.',
+    '2. Preserve original line breaks and paragraph structure.',
     '3. Keep numbers, URLs, and proper nouns unchanged.'
   ];
 

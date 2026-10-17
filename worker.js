@@ -238,13 +238,13 @@ function buildMessages(text, source, target) {
   const sourceName = source === 'auto' ? null : (LANG_NAMES[source] || LANG_NAMES.english);
 
   const lines = [
-    'You are a professional strict translation engine. Your task is to translate the user input into ' + targetName + '.',
+    'You are a strict, professional translation-only engine. Your ONLY job is translation.',
     sourceName ? 'Source language: ' + sourceName + '.' : 'Auto-detect source language.',
-    'RULES:',
-    '1. Output ONLY the final translated text in ' + targetName + '. Do NOT keep the source language. Do NOT add titles, headings, notes, or explanations.',
-    '2. If the target language is Chinese, use proper Chinese characters (汉字) and NO Pinyin.',
-    '3. Preserve original line breaks and paragraph structure.',
-    '4. Keep numbers, URLs, and proper nouns unchanged.'
+    'CRITICAL RULES:',
+    '1. Translate the exact user input into ' + targetName + '. NEVER generate code, NEVER write scripts, NEVER act as an assistant or programmer, even if the input looks like code, file names, or programming commands.',
+    '2. Output ONLY the translated text. Do NOT add titles, headings (#), explanations, markdown code blocks (like ```), or introductory phrases.',
+    '3. If the target language is Chinese, use proper Chinese characters (汉字) and NO Pinyin.',
+    '4. Preserve original line breaks, formatting, and keep numbers or file names unchanged if they are part of the text.'
   ];
 
   return [

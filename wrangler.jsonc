@@ -1,7 +1,6 @@
 {
   // Cloudflare Workers 配置文件
-  // 连接 GitHub 部署（Workers Builds）时，构建流程执行 `npx wrangler deploy`，
-  // 会自动读取本文件 —— 所以这里的绑定会「跟着部署一起生效」，无需再去控制台手点。
+  // 连接 GitHub 部署（Workers Builds）或本地执行 `npm run deploy` 时会自动读取本文件。
 
   "$schema": "node_modules/wrangler/config-schema.json",
 
@@ -12,32 +11,31 @@
   // 入口文件（模块化 Worker，export default { fetch }）
   "main": "worker.js",
 
-  // 兼容日期：决定 Workers 运行时行为，建议等于首次创建日期
+  // 兼容日期：决定 Workers 运行时行为
   "compatibility_date": "2026-10-15",
 
-  // 保留 workers.dev 子域访问（不配置则需自定义域名才能访问）
+  // 保留 workers.dev 子域访问
   "workers_dev": true,
+
+  // ★ 关键配置：保留云端已添加的环境变量！
+  // 设为 true 后，每次执行 `wrangler deploy`（包括 GitHub 自动部署）时，
+  // 不会清空或删除你在 Cloudflare Dashboard 控制台里手动添加的 API_URL、API_KEY、MODEL 等环境变量。
+  // 同时请注意：不要在下方的 "vars" 中定义 API_URL、API_KEY 或 MODEL，否则本地同名字段会覆盖云端值。
+  "keep_vars": true,
 
   // 开启线上日志 + 源码映射，异常堆栈能还原到 worker.js 的真实行号。
   // 配合 package.json 里的 `npm run tail` 可实时查看日志。
   "observability": { "enabled": true },
   "upload_source_maps": true,
 
-  // ★ 关键：Workers AI 绑定
-  // 写成这样即可，不需要在控制台创建任何资源、不产生额外费用
-  // （只有真正调用 env.AI.run() 时才按 token 计费）。
-  // 部署后 env.AI 就可用，对应 worker.js 里的 env.AI.run(...)。
+  // Workers AI 绑定：保留用于 /api/tts 语音合成功能（不调用不产生费用）
   "ai": {
     "binding": "AI"
-  },
-
-  // 运行时变量：换模型只改这里 + 重新部署，worker.js 不用动。
-  // 留空字符串时 worker.js 会回退到内置的 DEFAULT_MODEL。
-  "vars": {
-    "MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-
-    // 排障开关：设为 "1" 后，/api/tts 失败时响应会附带模型真实报错（detail 字段），
-    // 前端 toast 同步显示，便于定位「语音合成失败」的具体原因；排查完建议改回 "0"。
-    "TTS_DEBUG": "0"
   }
+
+  // 翻译环境变量说明（请在 Cloudflare Dashboard -> Settings -> Variables and Secrets 中添加）：
+  //   - API_URL : 外部大模型接口地址（如 https://api.openai.com/v1/chat/completions 或 https://api.deepseek.com）
+  //   - API_KEY : 接口密钥（建议类型选择 Secret 加密存储）
+  //   - MODEL   : 模型名称（如 gpt-4o-mini 或 deepseek-chat，支持逗号分隔多个备选模型）
+  // 本地开发（npm run dev）时，可在项目根目录创建 .dev.vars 文件配置上述三个变量。
 }

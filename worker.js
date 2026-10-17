@@ -1,8 +1,13 @@
 /**
- * AI 随身翻译 —— 单文件 Cloudflare Worker（v2.1 加固版）
+ * AI 随身翻译 —— 单文件 Cloudflare Worker（v2.2 外部 API 环境变量版）
  *
- * 部署：连接 GitHub（Workers Builds）或本地 `npx wrangler deploy`
- * 依赖：wrangler.jsonc 中的 `ai.binding = "AI"`（无需创建任何资源）
+ * 部署：连接 GitHub（Workers Builds）或本地 `npx wrangler deploy --keep-vars`
+ * 环境变量（在 Cloudflare Dashboard -> Settings -> Variables and Secrets 中添加）：
+ *   - API_URL : 翻译接口地址（支持 OpenAI 兼容接口，可填完整 /v1/chat/completions、/v1 或域名根路径）
+ *   - API_KEY : 翻译接口密钥（建议使用 Secret 加密变量存储）
+ *   - MODEL   : 翻译模型名称（支持单模型，也支持英文逗号分隔多个模型按顺序故障转移）
+ * 依赖：wrangler.jsonc 中的 `keep_vars: true` 确保每次重新部署不会覆盖或清空已添加的环境变量；
+ *       `ai.binding = "AI"` 保留用于 `/api/tts` 语音合成。
  *
  * 路由：
  *   POST /api/translate       翻译接口（支持流式 SSE）
@@ -46,14 +51,9 @@
  *   - Toast 动画与定时器、复制兜底、摄像头错误分类、OCR 进度
  */
 
-// 主模型：默认走 wrangler.jsonc 里 vars.MODEL，未配置时用这个
-const DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
-// 主模型不可用或额度不足时的降级备选（均为当前 Workers AI 在线模型）
-const FALLBACK_MODELS = [
-  '@cf/meta/llama-3.1-8b-instruct-fp8',
-  '@cf/meta/llama-4-scout-17b-16e-instruct',
-  '@cf/zai-org/glm-4.7-flash'
-];
+// 翻译服务通过环境变量 API_URL、API_KEY、MODEL 驱动（OpenAI Chat Completions 兼容接口）
+// MODEL 支持单个模型名（如 "gpt-4o-mini"）或逗号分隔的多个主备模型（如 "gpt-4o-mini,deepseek-chat"）
+const UPSTREAM_TIMEOUT_MS = 30000; // 上游翻译 API 超时时间（毫秒）
 
 // 语音合成（TTS）模型：
 //   主路径：全语种统一 @cf/myshell-ai/melotts，处理路径只有一条、行为可预期
@@ -288,7 +288,8 @@ function extractText(result) {
   const choiceContent = result.choices
     && result.choices[0]
     && ((result.choices[0].message && result.choices[0].message.content)
-      || (result.choices[0].delta && result.choices[0].delta.content));
+      || (result.choices[0].delta && result.choices[0].delta.content)
+      || (typeof result.choices[0].text === 'string' && result.choices[0].text));
   const candidates = [
     result.response,
     result.result && result.result.response,
@@ -352,17 +353,138 @@ async function wrapAiStream(upstream) {
   });
 }
 
-// 主模型不可用（额度/容量/流初始化失败）时按顺序降级
-async function runWithFailover(env, model, params) {
-  const models = Array.from(new Set([model, DEFAULT_MODEL].concat(FALLBACK_MODELS))).filter(Boolean);
+// 规范化 API_URL：支持填写完整 /chat/completions 地址、带版本号的基地址（如 .../v1、.../v4）或纯域名根地址
+function normalizeApiUrl(rawUrl) {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) return '';
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    const p = u.pathname.replace(/\/+$/, '');
+    if (!p) {
+      u.pathname = '/v1/chat/completions';
+    } else if (!/\/(chat\/)?completions$/i.test(p)) {
+      u.pathname = p + '/chat/completions';
+    } else {
+      u.pathname = p;
+    }
+    return u.toString();
+  } catch (e) {
+    return '';
+  }
+}
+
+// 读取并解析环境变量中的 API_URL、API_KEY 和 MODEL
+function getTranslateConfig(env) {
+  const rawUrl = (env && typeof env.API_URL === 'string') ? env.API_URL.trim() : '';
+  const apiKey = (env && typeof env.API_KEY === 'string') ? env.API_KEY.trim() : '';
+  const rawModel = (env && typeof env.MODEL === 'string') ? env.MODEL.trim() : '';
+  const models = Array.from(new Set(
+    rawModel.split(',').map(function (s) { return s.trim(); }).filter(Boolean)
+  ));
+  const missing = [];
+  if (!rawUrl) missing.push('API_URL');
+  if (!apiKey) missing.push('API_KEY');
+  if (!models.length) missing.push('MODEL');
+  const endpoint = rawUrl ? normalizeApiUrl(rawUrl) : '';
+  return {
+    rawUrl: rawUrl,
+    endpoint: endpoint,
+    apiKey: apiKey,
+    models: models,
+    missing: missing
+  };
+}
+
+// 调用外部 OpenAI 兼容接口（支持流式 SSE 与非流式 JSON）
+async function callExternalAi(endpoint, apiKey, model, params) {
+  const wantStream = !!(params && params.stream);
+  const body = {
+    model: model,
+    messages: params.messages,
+    max_tokens: params.max_tokens,
+    temperature: params.temperature,
+    stream: wantStream
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(function () { controller.abort(); }, UPSTREAM_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey,
+        'Accept': wantStream ? 'text/event-stream, application/json' : 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (fetchErr) {
+    clearTimeout(timer);
+    throw fetchErr;
+  }
+
+  if (!res.ok) {
+    clearTimeout(timer);
+    let detail = '';
+    try {
+      const errText = await res.text();
+      try {
+        const errJson = JSON.parse(errText);
+        detail = (errJson && errJson.error && (errJson.error.message || errJson.error.code || errJson.error))
+          || (errJson && errJson.message)
+          || errText;
+      } catch (_) {
+        detail = errText;
+      }
+    } catch (_) {}
+    const err = new Error('Upstream HTTP ' + res.status + (detail ? ': ' + String(detail).slice(0, 200) : ''));
+    err.status = res.status;
+    throw err;
+  }
+
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  if (wantStream) {
+    // 兼容部分上游即使传了 stream: true 也直接返回 JSON 的情况
+    if (ct.indexOf('application/json') !== -1) {
+      clearTimeout(timer);
+      const data = await res.json();
+      const text = extractText(data);
+      if (!text) throw new Error('Empty JSON response from upstream in stream mode');
+      return text;
+    }
+    if (!res.body || typeof res.body.getReader !== 'function') {
+      clearTimeout(timer);
+      return await res.text();
+    }
+    try {
+      const wrapped = await wrapAiStream(res.body);
+      clearTimeout(timer);
+      return wrapped;
+    } catch (streamInitErr) {
+      clearTimeout(timer);
+      throw streamInitErr;
+    }
+  }
+
+  try {
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 支持在环境变量 MODEL 中用逗号配置多个模型按顺序故障转移
+async function runWithFailover(config, params) {
+  const models = config.models;
   let lastError = null;
   for (let i = 0; i < models.length; i++) {
     const m = models[i];
     try {
-      let result = await env.AI.run(m, params);
-      if (params && params.stream && result && typeof result.getReader === 'function') {
-        result = await wrapAiStream(result);
-      }
+      const result = await callExternalAi(config.endpoint, config.apiKey, m, params);
       return { model: m, result: result };
     } catch (err) {
       lastError = err;
@@ -474,31 +596,36 @@ async function handleTranslate(request, env) {
   const target = LANG_NAMES[payload.target_lang] ? payload.target_lang : 'chinese';
   const wantStream = payload.stream === true;
 
-  if (!env.AI || typeof env.AI.run !== 'function') {
+  const config = getTranslateConfig(env);
+  if (config.missing.length > 0) {
     return jsonResponse({
-      error: '未绑定 Workers AI：请在 wrangler.jsonc 中声明 "ai": { "binding": "AI" }'
+      error: '未配置完整的翻译环境变量：请在 Cloudflare 环境变量中添加 ' + config.missing.join('、')
+    }, 500);
+  }
+  if (!config.endpoint) {
+    return jsonResponse({
+      error: '环境变量 API_URL 格式不正确，请配置合法的 http/https 接口地址'
     }, 500);
   }
 
-  const model = (typeof env.MODEL === 'string' && env.MODEL) || DEFAULT_MODEL;
   const messages = buildMessages(text, source, target);
   const params = { messages: messages, max_tokens: computeMaxTokens(text), temperature: TEMPERATURE };
 
   try {
     if (wantStream) {
       try {
-        const run = await runWithFailover(env, model, Object.assign({ stream: true }, params));
+        const run = await runWithFailover(config, Object.assign({ stream: true }, params));
         return sseResponse(run.result);
       } catch (streamErr) {
         log('warn', 'stream_failed_fallback_to_non_stream', { error: safeErr(streamErr) });
-        const run = await runWithFailover(env, model, params);
+        const run = await runWithFailover(config, params);
         const translated = extractText(run.result);
         if (!translated) throw streamErr;
         return sseResponse(translated);
       }
     }
 
-    const run = await runWithFailover(env, model, params);
+    const run = await runWithFailover(config, params);
     const translated = extractText(run.result);
     if (!translated) {
       return jsonResponse({ error: '模型没有返回内容，请稍后重试或换一段更短的文本' }, 502);
@@ -510,11 +637,17 @@ async function handleTranslate(request, env) {
       model: run.model
     });
   } catch (err) {
-    log('error', 'translate_failed', { error: safeErr(err) });
-    const busy = isCapacityError(err);
-    return jsonResponse({
-      error: busy ? '模型额度不足或暂时繁忙，请稍后重试' : '翻译服务出错，请稍后重试'
-    }, 502);
+    log('error', 'translate_failed', { error: safeErr(err), status: err && err.status });
+    const status = err && err.status;
+    let errMsg = '翻译服务出错，请稍后重试';
+    if (status === 401 || status === 403) {
+      errMsg = '翻译接口鉴权失败（HTTP ' + status + '），请检查环境变量 API_KEY';
+    } else if (status === 404) {
+      errMsg = '翻译接口地址或模型不存在（HTTP 404），请检查环境变量 API_URL 和 MODEL';
+    } else if (isCapacityError(err)) {
+      errMsg = '模型额度不足或暂时繁忙，请稍后重试';
+    }
+    return jsonResponse({ error: errMsg }, 502);
   }
 }
 
@@ -523,12 +656,20 @@ async function handleTranslate(request, env) {
 /* ------------------------------------------------------------------ */
 
 function healthResponse(env) {
+  const config = getTranslateConfig(env);
   return jsonResponse({
-    ok: true,
+    ok: config.missing.length === 0 && !!config.endpoint,
     service: 'ai-translate',
-    ai_bound: !!(env && env.AI),
-    default_model: (env && env.MODEL) || DEFAULT_MODEL,
-    fallback_models: FALLBACK_MODELS,
+    translate_env: {
+      configured: config.missing.length === 0 && !!config.endpoint,
+      api_url_set: !!config.rawUrl,
+      api_url_valid: !!config.endpoint,
+      api_key_set: !!config.apiKey,
+      model: config.models[0] || null,
+      fallback_models: config.models.slice(1),
+      missing: config.missing
+    },
+    tts_ai_bound: !!(env && env.AI),
     max_input_chars: MAX_INPUT_CHARS,
     rate_limit: { window_ms: RATE_LIMIT.WINDOW_MS, max_requests: RATE_LIMIT.MAX_REQUESTS }
   }, 200);
@@ -1209,12 +1350,17 @@ const HTML = `<!DOCTYPE html>
       if (!payload || payload === '[DONE]') continue;
       var obj;
       try { obj = JSON.parse(payload); } catch (e) { continue; }
-      if (obj && obj.error) throw new Error(String(obj.error));
+      if (obj && obj.error) {
+        var errMsg = (typeof obj.error === 'object' && obj.error.message) ? obj.error.message : obj.error;
+        throw new Error(String(errMsg));
+      }
       var piece = (obj && typeof obj.response === 'string')
         ? obj.response
         : (obj && obj.choices && obj.choices[0] && obj.choices[0].delta && typeof obj.choices[0].delta.content === 'string'
           ? obj.choices[0].delta.content
-          : null);
+          : (obj && obj.choices && obj.choices[0] && obj.choices[0].message && typeof obj.choices[0].message.content === 'string'
+            ? obj.choices[0].message.content
+            : null));
       if (piece !== null) onPiece(piece);
     }
     return rest;
@@ -1323,7 +1469,12 @@ const HTML = `<!DOCTYPE html>
 
       function pump() {
         return reader.read().then(function (chunk) {
-          if (chunk.done) return;
+          if (chunk.done) {
+            var tail = decoder.decode();
+            if (tail) buffer += tail;
+            if (buffer.trim()) parseSseChunk(buffer + '\\n', onPiece);
+            return;
+          }
           buffer += decoder.decode(chunk.value, { stream: true });
           buffer = parseSseChunk(buffer, onPiece);
           return pump();

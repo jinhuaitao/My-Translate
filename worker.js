@@ -56,10 +56,11 @@
 const UPSTREAM_TIMEOUT_MS = 30000; // 上游翻译 API 超时时间（毫秒）
 
 // 语音合成（TTS）模型：
-//   主路径：全语种统一 @cf/myshell-ai/melotts，处理路径只有一条、行为可预期
-//   （注意：它的必填参数叫 prompt 不是 text，默认 lang=en；曾因传错参数整条链路 502）
-//   降级链：melotts 失败时，英文自动换 @cf/deepgram/aura-2-en（speaker=luna）
-//   （Aura-2 此前表现「读得很乱」，疑似分块流未合并所致，toAudioBytes 已支持读全合并）
+//   主路径：全语种统一 @cf/myshell-ai/melotts
+//   音色统一说明：MeloTTS 中 lang="en" 与 lang="zh" 原本对应两个不同说话人模型（导致中英文朗读声音不统一），
+//   而其 "zh"（MeloTTS-Chinese / ZH_MIX_EN）本身是中英双语混合模型，可同时自然朗读中文、英文及中英混排文本。
+//   因此将中英文（zh / en）统一路由到 MeloTTS 的 "zh" 双语说话人，实现中英文朗读音色完全一致；
+//   若 "zh" 调用异常，英文再依次降级到 MeloTTS "en" 与 @cf/deepgram/aura-2-en。
 const TTS_MODEL = '@cf/myshell-ai/melotts';
 const TTS_MODEL_AURA_EN = '@cf/deepgram/aura-2-en';
 const TTS_SPEAKER_AURA = 'luna';
@@ -71,7 +72,7 @@ const MAX_TOKENS = 4096;           // 单次生成上限
 const CONTEXT_TOKENS = 8192;       // 主模型的保守上下文窗口，用于动态压缩 max_tokens
 const RESERVED_TOKENS = 512;       // 给 system prompt 与采样余量留的缓冲
 const TEMPERATURE = 0.2;           // 翻译任务低温求稳
-const SW_VERSION = 'ai-trans-v3';
+const SW_VERSION = 'ai-trans-v4';
 const HISTORY_LIMIT = 50;
 
 // 每 IP 限流（内存态，接近精确；跨 isolate 不共享，属于第一道闸门而非硬限制）
@@ -771,28 +772,45 @@ async function handleTts(request, env) {
     }, 500);
   }
 
+  // 根据音频文件头魔数自动识别真實 MIME 类型（RIFF -> audio/wav，其余 MP3 帧/ID3 -> audio/mpeg）
+  function detectAudioMime(bytes) {
+    if (bytes && bytes.length >= 4 &&
+        bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+      return 'audio/wav';
+    }
+    return 'audio/mpeg';
+  }
+
   // lang 由前端传 BCP-47（en-US / zh-CN ...），取两位语种码
   const prefix = String(payload.lang || 'en-US').toLowerCase().split('-')[0] || 'en';
+  // 统一中英文朗读声音：MeloTTS 的 "zh" 说话人原生支持中英双语（ZH_MIX_EN），
+  // 将 "en" 与 "zh" 均优先走 "zh" 说话人，避免英文（EN-Default）和中文（ZH）变成两个不同人的声音。
+  const candidateLangs = (prefix === 'en' || prefix === 'zh')
+    ? (prefix === 'en' ? ['zh', 'en'] : ['zh'])
+    : [prefix];
   let lastErr = null;
 
-  // 主路径：MeloTTS 全语种。注意参数名是 prompt（不是 text）
-  try {
-    const result = await env.AI.run(TTS_MODEL, { prompt: text, lang: prefix });
-    const bytes = await toAudioBytes(result);
-    if (bytes && bytes.length) {
-      return new Response(bytes, {
-        headers: {
-          'Content-Type': 'audio/wav',
-          'Cache-Control': 'no-store',
-          // 关掉中间层缓冲，避免音频被分段缓冲后拼接异常
-          'X-Accel-Buffering': 'no'
-        }
-      });
+  // 主路径：MeloTTS。注意参数名是 prompt（不是 text）
+  for (let i = 0; i < candidateLangs.length; i++) {
+    const meloLang = candidateLangs[i];
+    try {
+      const result = await env.AI.run(TTS_MODEL, { prompt: text, lang: meloLang });
+      const bytes = await toAudioBytes(result);
+      if (bytes && bytes.length) {
+        return new Response(bytes, {
+          headers: {
+            'Content-Type': detectAudioMime(bytes),
+            'Cache-Control': 'no-store',
+            // 关掉中间层缓冲，避免音频被分段缓冲后拼接异常
+            'X-Accel-Buffering': 'no'
+          }
+        });
+      }
+      log('warn', 'tts_empty_audio', { model: TTS_MODEL, lang: meloLang });
+    } catch (err) {
+      lastErr = err;
+      log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL, lang: meloLang });
     }
-    log('warn', 'tts_empty_audio', { model: TTS_MODEL, lang: prefix });
-  } catch (err) {
-    lastErr = err;
-    log('error', 'tts_failed', { error: safeErr(err), model: TTS_MODEL, lang: prefix });
   }
 
   // 降级：melotts 不可用（模型下线/额度/参数变更）时，英文换 Aura-2 兜底
@@ -1643,9 +1661,9 @@ const HTML = `<!DOCTYPE html>
 
   /* ---------- 朗读 / 复制 / 互换 / 清空 ---------- */
 
-  // 自动检测源语言时的朗读语言推断：先扫描全段再按优先级判定，
-  // 避免「先出现汉字就判中文」把日文误判（旧版 bug）
-  function guessSpeechLang(text) {
+  // 朗读语言推断：先根据文本实际字符特征判定非拉丁语种（避免下拉框所选语言与实际文本不一致），
+  // 若为纯拉丁字母文本，则优先采用下拉框指定的拉丁语种（如法/德/西/英），缺省回退 en-US。
+  function guessSpeechLang(text, preferredLang) {
     var sample = String(text || '').slice(0, 400);
     var flags = { ja: false, ko: false, zh: false, ru: false, ar: false, hi: false, th: false };
     for (var i = 0; i < sample.length; i++) {
@@ -1665,6 +1683,11 @@ const HTML = `<!DOCTYPE html>
     if (flags.hi) return 'hi-IN';
     if (flags.th) return 'th-TH';
     if (flags.zh) return 'zh-CN';
+    // 纯拉丁字符文本：若下拉框选的是法/德/西/意/葡/越/英等拉丁语系则沿用，否则按英文处理
+    var nonLatinPrefs = ['zh-CN', 'ja-JP', 'ko-KR', 'ru-RU', 'ar-SA', 'hi-IN', 'th-TH'];
+    if (preferredLang && nonLatinPrefs.indexOf(preferredLang) === -1) {
+      return preferredLang;
+    }
     return 'en-US';
   }
 
@@ -1709,7 +1732,8 @@ const HTML = `<!DOCTYPE html>
     }
 
     var langKey = type === 'source' ? els.source.value : els.target.value;
-    var lang = langKey === 'auto' ? guessSpeechLang(text) : (SPEECH_LANG[langKey] || 'en-US');
+    var preferred = langKey === 'auto' ? null : (SPEECH_LANG[langKey] || 'en-US');
+    var lang = guessSpeechLang(text, preferred);
 
     // 先进入「朗读中」视觉状态，请求或播放失败时再复位
     speakingBtn = btn;

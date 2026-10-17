@@ -280,22 +280,47 @@ function computeMaxTokens(text) {
 // Workers AI 不同模型返回结构略有差异，这里统一兜底取文本
 function extractText(result) {
   if (!result) return '';
-  if (typeof result === 'string') return result.trim();
-  const choiceContent = result.choices
-    && result.choices[0]
-    && ((result.choices[0].message && result.choices[0].message.content)
-      || (result.choices[0].delta && result.choices[0].delta.content)
-      || (typeof result.choices[0].text === 'string' && result.choices[0].text));
-  const candidates = [
-    result.response,
-    result.result && result.result.response,
-    choiceContent,
-    result.output_text,
-    result.text
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.trim()) return c.trim();
+  let text = '';
+  
+  if (typeof result === 'string') {
+    text = result;
+  } else {
+    const choiceContent = result.choices
+      && result.choices[0]
+      && ((result.choices[0].message && result.choices[0].message.content)
+        || (result.choices[0].delta && result.choices[0].delta.content)
+        || (typeof result.choices[0].text === 'string' && result.choices[0].text));
+    const candidates = [
+      result.response,
+      result.result && result.result.response,
+      choiceContent,
+      result.output_text,
+      result.text
+    ];
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.trim()) {
+        text = c;
+        break;
+      }
+    }
   }
+
+  // 核心：如果模型输出了 <think>...</think> 思考标签，将其整体剥离，只保留后面的翻译结果
+  if (text) {
+    // 1. 如果包含完整的 <think>...</think>，直接替换为空
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+    // 2. 如果模型还在思考中（只有开头的 <think> 但还没闭合），把包含 <think> 的前半部分切掉
+    const openIndex = text.indexOf('<think>');
+    if (openIndex !== -1) {
+      text = text.substring(openIndex + 7);
+    }
+    const closeIndex = text.indexOf('</think>');
+    if (closeIndex !== -1) {
+      text = text.substring(closeIndex + 8);
+    }
+    return text.trim();
+  }
+
   return '';
 }
 

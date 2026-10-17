@@ -334,32 +334,77 @@ function isCapacityError(err) {
 // 2. 若流传输中途报错，转为标准错误 SSE 帧并正常结束流，避免连接异常断开导致浏览器报 Failed to fetch。
 async function wrapAiStream(upstream) {
   const reader = upstream.getReader();
-  const first = await reader.read();
+  const dec = new TextDecoder();
   const enc = new TextEncoder();
-  let firstSent = false;
+
+  let sseBuffer = '';
+  let modelTextBuffer = '';
+  let thinkClosed = false;
 
   return new ReadableStream({
-    start(controller) {
-      if (first.done) {
-        controller.enqueue(enc.encode('data: [DONE]\n\n'));
-        controller.close();
-        return;
-      }
-      if (first.value && first.value.length) {
-        controller.enqueue(first.value);
-      }
-      firstSent = true;
-    },
-    async pull(controller) {
-      if (!firstSent) return;
+    async start(controller) {
       try {
-        const step = await reader.read();
-        if (step.done) {
-          controller.close();
-          return;
-        }
-        if (step.value && step.value.length) {
-          controller.enqueue(step.value);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.enqueue(enc.encode('data: [DONE]\n\n'));
+            controller.close();
+            break;
+          }
+
+          sseBuffer += dec.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop(); // 保留最后一行未完成的片段
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.indexOf('data:') !== 0) continue;
+            const payload = trimmed.slice(5).trim();
+            if (payload === '[DONE]') continue;
+
+            try {
+              const obj = JSON.parse(payload);
+              const piece = obj.choices && obj.choices[0] && (
+                (obj.choices[0].delta && obj.choices[0].delta.content) ||
+                (obj.choices[0].message && obj.choices[0].message.content) ||
+                obj.choices[0].text
+              );
+
+              if (piece) {
+                modelTextBuffer += piece;
+
+                // 如果还没检测到思考结束标签 </think>
+                if (!thinkClosed) {
+                  const closeIdx = modelTextBuffer.indexOf('</think>');
+                  if (closeIdx !== -1) {
+                    // 找到 </think>！说明思考结束，截取后面的正式译文开始推送
+                    thinkClosed = true;
+                    const remaining = modelTextBuffer.substring(closeIdx + 8);
+                    modelTextBuffer = '';
+                    if (remaining) {
+                      const outObj = { response: remaining };
+                      controller.enqueue(enc.encode('data: ' + JSON.stringify(outObj) + '\n\n'));
+                    }
+                  } else {
+                    // 如果累积了较多字符依然没有 <think> 标签（说明这不是推理模型），则直接放行
+                    if (modelTextBuffer.length > 20 && modelTextBuffer.indexOf('<think>') === -1) {
+                      thinkClosed = true;
+                      const out = modelTextBuffer;
+                      modelTextBuffer = '';
+                      const outObj = { response: out };
+                      controller.enqueue(enc.encode('data: ' + JSON.stringify(outObj) + '\n\n'));
+                    }
+                  }
+                } else {
+                  // 已经过了思考阶段，正常流式输出译文
+                  const outObj = { response: piece };
+                  controller.enqueue(enc.encode('data: ' + JSON.stringify(outObj) + '\n\n'));
+                }
+              }
+            } catch (e) {
+              // 忽略解析异常
+            }
+          }
         }
       } catch (err) {
         log('error', 'stream_pull_failed', { error: safeErr(err) });

@@ -241,9 +241,10 @@ function buildMessages(text, source, target) {
     'You are a professional strict translation engine. Translate the user input into ' + targetName + '.',
     sourceName ? 'Source language: ' + sourceName + '.' : 'Auto-detect source language.',
     'RULES:',
-    '1. Output ONLY the translated text. Do NOT add titles, headings (#), notes, explanations, or introductory phrases.',
-    '2. Preserve original line breaks and paragraph structure.',
-    '3. Keep numbers, URLs, and proper nouns unchanged.'
+    '1. Output ONLY the translated text in proper Chinese characters (汉字). Do NOT output Pinyin under any circumstances.',
+    '2. Do NOT add titles, headings (#), notes, explanations, or introductory phrases.',
+    '3. Preserve original line breaks and paragraph structure.',
+    '4. Keep numbers, URLs, and proper nouns unchanged.'
   ];
 
   return [

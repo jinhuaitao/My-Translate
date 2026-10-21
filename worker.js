@@ -18,7 +18,7 @@
  *   GET  /icon.svg            应用图标（普通）
  *   GET  /icon-maskable.svg   应用图标（maskable）
  *   GET  /icon.png            旧路径别名，返回同一份 SVG
- *   GET  /favicon.ico         地址栏图标（返回 SVG，省一个 404）
+ *   GET  /favicon.ico         地址栏图标（返回 SVG，省一个404）
  *   GET  /                    应用页面
  *
  * 安全说明：API 有意不开放跨域（CORS），仅同源页面可调用；

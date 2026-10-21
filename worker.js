@@ -347,6 +347,24 @@ async function wrapAiStream(upstream) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            // 收尾时把残留缓冲一次性放行：短文本（累计 ≤20 字）从未触发放行条件，
+            // 不在这里冲掉就会被静默丢弃，前端误报"模型没有返回内容"。
+            let tail = '';
+            if (!thinkClosed) {
+              const closeIdx = modelTextBuffer.indexOf('</think>');
+              if (closeIdx !== -1) {
+                tail = modelTextBuffer.substring(closeIdx + 8);
+              } else if (modelTextBuffer.indexOf('<think>') === -1) {
+                // 非推理模型：直接放行残留译文
+                tail = modelTextBuffer;
+              }
+              // 仍在 <think> 中且未闭合：思考未完成，丢弃残留，避免半截思考污染译文
+            } else {
+              tail = modelTextBuffer;
+            }
+            if (tail) {
+              controller.enqueue(enc.encode('data: ' + JSON.stringify({ response: tail }) + '\n\n'));
+            }
             controller.enqueue(enc.encode('data: [DONE]\n\n'));
             controller.close();
             break;
@@ -399,6 +417,7 @@ async function wrapAiStream(upstream) {
                   // 已经过了思考阶段，正常流式输出译文
                   const outObj = { response: piece };
                   controller.enqueue(enc.encode('data: ' + JSON.stringify(outObj) + '\n\n'));
+                  modelTextBuffer = ''; // 已发出，清空以免收尾时重复发送
                 }
               }
             } catch (e) {

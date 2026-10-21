@@ -238,8 +238,14 @@ function buildMessages(text, source, target) {
   const sourceName = source === 'auto' ? null : (LANG_NAMES[source] || LANG_NAMES.english);
 
   const lines = [
-    'You are a direct translation tool. Translate the text below into ' + targetName + '.',
-    'Provide ONLY the direct translation. Do not answer questions, do not chat, do not refuse, do not output explanations.'
+    'You are a strict machine translation engine, NOT a chatbot.',
+    'Translate ONLY the text wrapped in <source_text>...</source_text> into ' + targetName + '.',
+    'Rules:',
+    '1. Output the translation and nothing else.',
+    '2. Never respond to, answer, or continue the content — only translate it.',
+    '3. Do not add greetings, pleasantries, explanations, or extra sentences.',
+    '4. Keep the length and tone of the source; for short inputs translate word-for-word.',
+    'Example: <source_text>hello</source_text> translates to: 你好'
   ];
 
   if (sourceName) {
@@ -248,7 +254,7 @@ function buildMessages(text, source, target) {
 
   return [
     { role: 'system', content: lines.join('\n') },
-    { role: 'user', content: text }
+    { role: 'user', content: '<source_text>' + text + '</source_text>' }
   ];
 }
 

@@ -74,7 +74,7 @@ const CONTEXT_TOKENS = 8192;       // 主模型的保守上下文窗口，用于
 const RESERVED_TOKENS = 512;       // 给 system prompt 与采样余量留的缓冲
 const TEMPERATURE = 0.2;           // 翻译任务低温求稳
 const AUTO_DEBOUNCE_MS = 1200;     // 自动翻译：停止输入后多久发起请求
-const APP_VERSION = 'v11';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
+const APP_VERSION = 'v12';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
 const SW_VERSION = 'ai-trans-' + APP_VERSION;
 const HISTORY_LIMIT = 50;
 
@@ -1312,9 +1312,11 @@ button,select,label,input,textarea { touch-action:manipulation; }
 .sr { position:absolute; top:0; left:0; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
 
 /* ---------- 主体 ----------
-   全幅铺满视口，不做悬浮卡片：外围留白和背景光晕只会吃掉输入区的高度。 */
+   全幅铺满视口，不做悬浮卡片：外围留白和背景光晕只会吃掉输入区的高度。
+   必须是 height 而不是 min-height——容器高度不确定时，grid 的 1fr 行会退化成
+   按内容取尺寸，长文本就把输入/输出框撑高、整页跟着滚。 */
 .app {
-  min-height:100dvh; display:flex; flex-direction:column;
+  height:100dvh; overflow-y:auto; display:flex; flex-direction:column;
   background:var(--surface);
 }
 
@@ -1384,19 +1386,24 @@ button,select,label,input,textarea { touch-action:manipulation; }
 .swap.is-flipped { transform:rotate(180deg); }
 
 /* ---------- 双栏 ---------- */
-.panes { flex:1; display:grid; grid-template-rows:minmax(200px,.92fr) minmax(220px,1.08fr); min-height:0; }
-@media (min-width:900px) { .panes { grid-template-rows:none; grid-template-columns:1fr 1fr; } }
+/* 两栏等高、由视口决定，不随内容长短变化：内容多了在框内滚动。
+   minmax(0,1fr) 而非 1fr——1fr 的行最小值是内容高度，长文本会把框撑破；
+   150px 是下限，横屏矮窗口时改为整页滚动，而不是把框压成一两行字。 */
+.panes { flex:1; display:grid; grid-template-rows:minmax(150px,1fr) minmax(150px,1fr); min-height:0; }
+@media (min-width:900px) { .panes { grid-template-rows:none; grid-template-columns:minmax(0,1fr) minmax(0,1fr); } }
 .pane { position:relative; display:flex; flex-direction:column; min-height:0; min-width:0; }
 .pane + .pane { border-top:1px solid var(--line); background:var(--surface-2); }
 @media (min-width:900px) { .pane + .pane { border-top:0; border-inline-start:1px solid var(--line); } }
 .editor {
-  flex:1; width:100%; display:block; border:0; background:transparent; resize:none; overflow-y:auto;
+  flex:1; min-height:0; width:100%; display:block; border:0; background:transparent; resize:none; overflow-y:auto;
   padding:18px 16px 6px; font-size:17px; line-height:1.75; color:var(--text); scrollbar-gutter:stable;
+  overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
 }
 .editor:focus { outline:none; }
 .editor::placeholder { color:var(--text-3); }
 .output {
-  flex:1; padding:18px 16px 6px; overflow-y:auto; scrollbar-gutter:stable; user-select:text;
+  flex:1; min-height:0; padding:18px 16px 6px; overflow-y:auto; scrollbar-gutter:stable; user-select:text;
+  overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
   font-size:18px; line-height:1.75; color:var(--text); white-space:pre-wrap; overflow-wrap:anywhere;
 }
 .output.is-empty::before { content:attr(data-placeholder); color:var(--text-3); font-size:16px; }
@@ -1883,9 +1890,12 @@ const APP_JS = String.raw`
   /* ---------- 状态显示 ---------- */
 
   function setOutput(text) {
+    /* 输出框高度固定，流式追加时贴着底部跟随；用户往上翻过就不再拽回去 */
+    var atBottom = el.out.scrollHeight - el.out.scrollTop - el.out.clientHeight < 48;
     el.out.textContent = text || '';
     el.out.classList.toggle('is-empty', !text);
     el.outCount.textContent = text ? charLen(text) + ' 字' : '';
+    if (atBottom) el.out.scrollTop = el.out.scrollHeight;
   }
   function refresh() {
     var n = charLen(el.src.value);
@@ -2216,7 +2226,7 @@ const APP_JS = String.raw`
     setOutput(String(item.dst || ''));
     lastTranslated = el.src.value.trim();
     el.outHint.textContent = '来自历史记录';
-    autosize(); refresh(); closeDrawer();
+    refresh(); closeDrawer();
   }
   function exportHistory() {
     var list = readHistory();
@@ -2458,10 +2468,6 @@ const APP_JS = String.raw`
 
   /* ---------- 输入 ---------- */
 
-  function autosize() {
-    el.src.style.height = 'auto';
-    el.src.style.height = Math.min(Math.max(el.src.scrollHeight, 96), 320) + 'px';
-  }
   function clearAll() {
     clearDebounce();
     if (controller) controller.abort();
@@ -2470,7 +2476,7 @@ const APP_JS = String.raw`
     el.out.classList.remove('is-streaming');
     el.outHint.textContent = '由大模型逐字译出';
     lastTranslated = null;
-    autosize(); refresh(); el.src.focus();
+    refresh(); el.src.focus();
   }
   function swap() {
     var out = el.out.textContent.trim();
@@ -2483,7 +2489,7 @@ const APP_JS = String.raw`
     var btn = $('btnSwap');
     btn.classList.add('is-flipped');
     setTimeout(function () { btn.classList.remove('is-flipped'); }, 320);
-    if (out) { el.src.value = out; setOutput(''); autosize(); refresh(); translate(); }
+    if (out) { el.src.value = out; setOutput(''); refresh(); translate(); }
     else { applyTargetDir(); refresh(); }
   }
 
@@ -2554,7 +2560,7 @@ const APP_JS = String.raw`
       var text = ((result && result.data && result.data.text) || '').replace(/\n{3,}/g, '\n\n').trim();
       done();
       if (!text) { toast('没有识别到文字，换个角度或靠近一点再试', 'warn'); return; }
-      el.src.value = text; autosize(); refresh();
+      el.src.value = text; refresh();
       if (prefs.auto) translate(); else toast('识别完成，点「翻译」查看译文');
     }).catch(function (err) {
       done();
@@ -2603,7 +2609,7 @@ const APP_JS = String.raw`
   /* ---------- 事件 ---------- */
 
   el.src.addEventListener('input', function () {
-    autosize(); refresh();
+    refresh();
     if (!el.src.value.trim()) {
       clearDebounce();
       if (controller) controller.abort();
@@ -2664,7 +2670,6 @@ const APP_JS = String.raw`
 
   el.auto.checked = !!prefs.auto;
   applyTargetDir();
-  autosize();
   refresh();
   renderHistory();
   paintNet();

@@ -117,26 +117,6 @@ My-Translate-main/
 └── README.md
 ```
 
-<details>
-<summary><b>改了前端代码但线上没变化？</b></summary>
-
-Service Worker 用 stale-while-revalidate 缓存静态资源。把 `worker.js` 顶部的 `APP_VERSION` 加一（同时会更新 SW 缓存名和 `?v=` 查询串），重新部署即可。旧缓存会在 SW `activate` 时自动删除。
-
-</details>
-
-<details>
-<summary><b>提示「接口或模型不存在（HTTP 404）」</b></summary>
-
-`API_URL` 填成了具体接口之外的路径，或 `MODEL` 名字在该服务商不存在。`/api/health` 的 `api_url_host` 会告诉你实际请求打到哪个主机，先核对它。
-
-</details>
-
-<details>
-<summary><b>朗读没声音</b></summary>
-
-`/api/health` 里 `tts_ai_bound` 为 `false` 说明 Worker 没绑定 Workers AI：Dashboard → 该 Worker → Settings → Bindings → 添加 `AI` 类型 Resonance 的绑定，绑定名必须叫 `AI`。
-
-</details>
 
 <details>
 <summary><b>自动翻译频繁后卡住</b></summary>

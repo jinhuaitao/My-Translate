@@ -74,7 +74,7 @@ const CONTEXT_TOKENS = 8192;       // 主模型的保守上下文窗口，用于
 const RESERVED_TOKENS = 512;       // 给 system prompt 与采样余量留的缓冲
 const TEMPERATURE = 0.2;           // 翻译任务低温求稳
 const AUTO_DEBOUNCE_MS = 1200;     // 自动翻译：停止输入后多久发起请求
-const APP_VERSION = 'v10';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
+const APP_VERSION = 'v11';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
 const SW_VERSION = 'ai-trans-' + APP_VERSION;
 const HISTORY_LIMIT = 50;
 
@@ -140,6 +140,9 @@ const SECURITY_HEADERS = {
 };
 
 const HTML_SECURITY_HEADERS = Object.assign({
+  // camera 保持授权：拍照现在走 <input capture>，规范上它不经过 getUserMedia 的权限体系，
+  // 但该行为无法在桌面端验证，而 Android 各家实现不一 —— 收紧它有可能直接废掉拍照，
+  // 而多留这一个权限并没有实际暴露面（页面里已经没有 getUserMedia 调用）。
   'Permissions-Policy': 'camera=(self), microphone=(), geolocation=()',
   'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
   'Cross-Origin-Opener-Policy': 'same-origin',
@@ -1547,41 +1550,15 @@ html[dir="rtl"] .search input { padding:0 32px 0 12px; }
 .toast .t-act { color:var(--accent); font-weight:700; white-space:nowrap; pointer-events:auto; }
 .toast--err .t-act, .toast--warn .t-act { color:inherit; text-decoration:underline; }
 
-/* ---------- 相机 ---------- */
-.camera { position:fixed; inset:0; z-index:100; display:none; flex-direction:column; background:#05070c; }
-.camera.is-open { display:flex; }
-.cam-view { position:relative; flex:1; overflow:hidden; background:#000; }
-.cam-view video { width:100%; height:100%; object-fit:cover; }
-.guides { position:absolute; inset:0; pointer-events:none; }
-.guides::before {
-  content:''; position:absolute; inset:14% 8%; border-radius:14px;
-  border:1px solid rgba(255,255,255,.3); box-shadow:0 0 0 200vmax rgba(5,7,12,.5);
-}
-.scan {
-  position:absolute; left:8%; right:8%; height:2px;
-  background:linear-gradient(90deg,transparent,var(--brand-2),var(--brand-1),transparent);
-  box-shadow:0 0 14px rgba(6,182,212,.9); animation:scan 2.6s ease-in-out infinite;
-}
-@keyframes scan { 0%,100% { top:16%; opacity:.25; } 50% { top:82%; opacity:1; } }
+/* ---------- 识别进度 ----------
+   拍照交给系统相机后，页面里只剩这一条进度，贴在原文区底部。 */
 .ocr {
-  position:absolute; inset-inline-start:50%; bottom:22px; transform:translateX(-50%);
-  display:flex; align-items:center; gap:9px; padding:9px 15px; border-radius:999px; white-space:nowrap;
-  background:rgba(10,14,22,.84); color:#fff; font-size:12.5px; font-weight:600; border:1px solid rgba(255,255,255,.14);
+  display:flex; align-items:center; gap:10px; margin:0 16px 6px; padding:8px 13px;
+  border-radius:999px; white-space:nowrap; font-size:12.5px; font-weight:600;
+  color:var(--accent); background:var(--accent-soft); border:1px solid var(--accent-line);
 }
-.ocr .bar { width:74px; height:4px; border-radius:2px; background:rgba(255,255,255,.22); overflow:hidden; }
+.ocr .bar { flex:1; height:4px; border-radius:2px; background:var(--surface-3); overflow:hidden; }
 .ocr .bar span { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--brand-1),var(--brand-2)); transition:width .2s; }
-.cam-bar {
-  display:flex; align-items:center; justify-content:space-between; padding:0 26px;
-  height:calc(96px + env(safe-area-inset-bottom)); padding-bottom:env(safe-area-inset-bottom);
-}
-.cam-btn { width:44px; height:44px; border-radius:50%; display:grid; place-items:center; font-size:22px; color:#fff; background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.18); }
-.shutter { width:66px; height:66px; border-radius:50%; display:grid; place-items:center; border:3px solid rgba(255,255,255,.9); transition:transform .14s; }
-.shutter span { width:52px; height:52px; border-radius:50%; background:#fff; }
-.shutter:active { transform:scale(.9); }
-.shutter:disabled { opacity:.45; }
-.flash { position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; }
-.flash.is-go { animation:flash .35s ease-out; }
-@keyframes flash { 0% { opacity:.85; } 100% { opacity:0; } }
 
 /* ---------- 展示模式 ---------- */
 .present {
@@ -1688,6 +1665,7 @@ __ICONS__
       <textarea class="editor" id="inputText" dir="auto" rows="3" spellcheck="false"
         autocomplete="off" autocapitalize="off" autocorrect="off"
         placeholder="输入文字，或点相机图标拍照识别…"></textarea>
+      <div class="ocr" id="ocrStatus" hidden><span id="ocrMsg">准备中</span><span class="bar"><span id="ocrBar"></span></span><span id="ocrPct">0%</span></div>
       <div class="hint"><svg class="ic"><use href="#i-clock"/></svg><span id="srcHint">停止输入后自动翻译</span><span class="desk-only"><span class="kbd">⌘/Ctrl</span>+<span class="kbd">Enter</span> 立即翻译</span></div>
       <div class="toolbar">
         <div class="toolbar-left">
@@ -1698,6 +1676,7 @@ __ICONS__
           <div class="toolset">
             <button class="tool" id="btnSpeakSource" type="button" aria-label="朗读原文" title="朗读原文"><svg class="ic"><use href="#i-volume"/></svg></button>
             <button class="tool" id="btnCamera" type="button" aria-label="拍照识别" title="拍照识别"><svg class="ic"><use href="#i-camera"/></svg></button>
+            <button class="tool" id="btnImage" type="button" aria-label="从相册选择图片" title="相册选图识别"><svg class="ic"><use href="#i-image"/></svg></button>
             <button class="tool" id="btnClear" type="button" aria-label="清空输入" title="清空"><svg class="ic"><use href="#i-eraser"/></svg></button>
           </div>
         </div>
@@ -1753,19 +1732,10 @@ __ICONS__
   </div>
 </div>
 
-<div class="camera" id="camera" role="dialog" aria-modal="true" aria-label="拍照识别">
-  <div class="cam-view">
-    <video id="cameraVideo" autoplay playsinline muted></video>
-    <div class="guides"><div class="scan"></div></div>
-    <div class="ocr" id="ocrStatus" hidden><span id="ocrMsg">准备中</span><span class="bar"><span id="ocrBar"></span></span><span id="ocrPct">0%</span></div>
-    <div class="flash" id="camFlash"></div>
-  </div>
-  <div class="cam-bar">
-    <button class="cam-btn" id="btnCloseCamera" type="button" aria-label="关闭相机"><svg class="ic"><use href="#i-close"/></svg></button>
-    <button class="shutter" id="btnCapture" type="button" aria-label="拍照并识别"><span></span></button>
-    <button class="cam-btn" id="btnGallery" type="button" aria-label="从相册选择图片"><svg class="ic"><use href="#i-image"/></svg></button>
-  </div>
-</div>
+<!-- 拍照走系统相机：capture 让移动端直接拉起后置镜头，
+     比网页内 getUserMedia 取景更稳（不用申请权限、能变焦、iOS 不黑屏）。
+     相册入口单独一个 input：capture 属性一旦设上，部分浏览器就不再给「选照片」选项。 -->
+<input type="file" id="camInput" accept="image/*" capture="environment" class="sr">
 <input type="file" id="fileInput" accept="image/*" class="sr">
 
 <div class="present" id="present" role="dialog" aria-modal="true" aria-label="译文展示">
@@ -1807,16 +1777,16 @@ const APP_JS = String.raw`
     scrim: $('scrim'), drawer: $('drawer'), histList: $('histList'), histSearch: $('histSearch'),
     histCount: $('histCount'), modal: $('modal'), modalBody: $('modalBody'), modalActions: $('modalActions'),
     modalTitle: $('modalTitle'), modalSub: $('modalSub'), toasts: $('toasts'),
-    camera: $('camera'), video: $('cameraVideo'), ocr: $('ocrStatus'), ocrMsg: $('ocrMsg'),
-    ocrBar: $('ocrBar'), ocrPct: $('ocrPct'), capture: $('btnCapture'), flash: $('camFlash'), file: $('fileInput'),
+    ocr: $('ocrStatus'), ocrMsg: $('ocrMsg'), ocrBar: $('ocrBar'), ocrPct: $('ocrPct'),
+    camInput: $('camInput'), file: $('fileInput'),
     present: $('present'), presentText: $('presentText'), presentLang: $('presentLang')
   };
 
   var prefs = loadPrefs();
   var busy = false, seq = 0, controller = null, debounceTimer = null;
-  var lastTranslated = null, speaking = null, audioEl = null, mediaStream = null;
+  var lastTranslated = null, speaking = null, audioEl = null;
   var lastFocus = null, health = null, quotaLeft = null, retryAt = 0;
-  var tessLoading = null;
+  var tessLoading = null, ocrBusy = false;
 
   /* ---------- 偏好存储 ---------- */
 
@@ -2553,52 +2523,11 @@ const APP_JS = String.raw`
     });
     return tessLoading;
   }
-  var CAMERA_ERRORS = {
-    NotAllowedError: '摄像头权限被拒绝，请在浏览器设置中允许后重试',
-    NotFoundError: '没有找到可用的摄像头',
-    NotReadableError: '摄像头被其他程序占用，请关闭后重试',
-    OverconstrainedError: '摄像头不支持所需的分辨率',
-    SecurityError: '需要 HTTPS 环境才能使用摄像头'
-  };
-  function openCamera() {
-    if (cameraOpen()) return;
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      pickFile(); toast('当前环境不支持摄像头，可直接选择图片', 'warn'); return;
-    }
-    // 授权弹窗可能停留几秒，期间按钮保持高亮，否则用户以为没点到
-    var btn = $('btnCamera');
-    btn.classList.add('is-on');
-    var done = function () { btn.classList.remove('is-on'); };
-    navigator.mediaDevices.getUserMedia({
-      audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 } }
-    }).then(function (s) {
-      done();
-      mediaStream = s;
-      el.video.srcObject = s;
-      el.camera.classList.add('is-open');
-      return loadTesseract().catch(function (err) {
-        toast((err && err.message) || '识别库加载失败', 'warn');
-      });
-    }).catch(function (err) {
-      done();
-      toast(CAMERA_ERRORS[err && err.name] || '无法打开摄像头', 'err');
-    });
-  }
-  function closeCamera() {
-    el.camera.classList.remove('is-open');
-    el.ocr.hidden = true;
-    if (mediaStream) { mediaStream.getTracks().forEach(function (t) { t.stop(); }); mediaStream = null; }
-  }
-  function cameraOpen() { return el.camera.classList.contains('is-open'); }
-  function pickFile() { el.file.click(); }
+  function pickFile(which) { (which === 'cam' ? el.camInput : el.file).click(); }
 
   function recognize(source) {
-    if (!window.Tesseract) {
-      toast('识别库还在加载，请稍候再试', 'warn');
-      loadTesseract().catch(function (err) { toast((err && err.message) || '识别库加载失败', 'err'); });
-      return;
-    }
-    el.capture.disabled = true;
+    if (ocrBusy) { toast('正在识别上一张，请稍候', 'warn'); return; }
+    ocrBusy = true;
     var key = el.source.value;
     var base = key === 'auto' ? 'eng+chi_sim' : (LANGS[key] ? LANGS[key].ocr : 'eng');
     var ocrLang = base.indexOf('eng') > -1 ? base : base + '+eng';
@@ -2606,6 +2535,7 @@ const APP_JS = String.raw`
     el.ocr.hidden = false;
     el.ocrMsg.textContent = '正在准备识别引擎';
     el.ocrBar.style.width = '4%'; el.ocrPct.textContent = '4%';
+    var done = function () { ocrBusy = false; el.ocr.hidden = true; };
 
     window.Tesseract.recognize(source, ocrLang, {
       logger: function (m) {
@@ -2622,39 +2552,25 @@ const APP_JS = String.raw`
       }
     }).then(function (result) {
       var text = ((result && result.data && result.data.text) || '').replace(/\n{3,}/g, '\n\n').trim();
-      closeCamera();
+      done();
       if (!text) { toast('没有识别到文字，换个角度或靠近一点再试', 'warn'); return; }
       el.src.value = text; autosize(); refresh();
       if (prefs.auto) translate(); else toast('识别完成，点「翻译」查看译文');
     }).catch(function (err) {
+      done();
       toast('文字识别失败：' + ((err && err.message) || '请重试'), 'err');
-    }).then(function () {
-      el.capture.disabled = false;
-      el.ocr.hidden = true;
     });
   }
 
-  function capture() {
-    if (!el.video.videoWidth) { toast('摄像头还没准备好，请稍等', 'warn'); return; }
-    el.flash.classList.remove('is-go');
-    void el.flash.offsetWidth;
-    el.flash.classList.add('is-go');
-    if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) {} }
-    var MAX_W = 1600;
-    var scale = Math.min(1, MAX_W / el.video.videoWidth);
-    var cv = document.createElement('canvas');
-    cv.width = Math.round(el.video.videoWidth * scale);
-    cv.height = Math.round(el.video.videoHeight * scale);
-    cv.getContext('2d').drawImage(el.video, 0, 0, cv.width, cv.height);
-    recognize(cv.toDataURL('image/jpeg', 0.92));
-  }
-
+  /* 系统相机拍完就把文件回传给页面，所以拍照和相册共用同一个处理函数 */
   function onFile(ev) {
     var f = ev.target.files && ev.target.files[0];
     ev.target.value = '';
     if (!f) return;
     if (!/^image\//.test(f.type)) { toast('请选择图片文件', 'warn'); return; }
-    if (!cameraOpen()) { el.camera.classList.add('is-open'); }
+    el.ocr.hidden = false;
+    el.ocrMsg.textContent = '加载识别引擎';
+    el.ocrBar.style.width = '2%'; el.ocrPct.textContent = '2%';
     loadTesseract().then(function () {
       var url = URL.createObjectURL(f);
       var img = new Image();
@@ -2668,9 +2584,12 @@ const APP_JS = String.raw`
         URL.revokeObjectURL(url);
         recognize(cv.toDataURL('image/jpeg', 0.92));
       };
-      img.onerror = function () { URL.revokeObjectURL(url); toast('图片读取失败', 'err'); };
+      img.onerror = function () { URL.revokeObjectURL(url); el.ocr.hidden = true; toast('图片读取失败', 'err'); };
       img.src = url;
-    }).catch(function (err) { closeCamera(); toast((err && err.message) || '识别库加载失败', 'err'); });
+    }).catch(function (err) {
+      el.ocr.hidden = true;
+      toast((err && err.message) || '识别库加载失败', 'err');
+    });
   }
 
   /* ---------- 网络状态 ---------- */
@@ -2706,7 +2625,8 @@ const APP_JS = String.raw`
   $('btnSwap').addEventListener('click', swap);
   $('btnSpeakSource').addEventListener('click', function (ev) { speak(el.src.value.trim(), el.source.value, ev.currentTarget); });
   $('btnSpeakTarget').addEventListener('click', function (ev) { speak(el.out.textContent.trim(), el.target.value, ev.currentTarget); });
-  $('btnCamera').addEventListener('click', openCamera);
+  $('btnCamera').addEventListener('click', function () { pickFile('cam'); });
+  $('btnImage').addEventListener('click', function () { pickFile('gallery'); });
   $('btnClear').addEventListener('click', clearAll);
   $('btnCopy').addEventListener('click', function () { copyText(el.out.textContent.trim(), '已复制译文'); });
   $('btnShare').addEventListener('click', share);
@@ -2721,15 +2641,12 @@ const APP_JS = String.raw`
   $('btnExportHistory').addEventListener('click', exportHistory);
   $('btnClearHistory').addEventListener('click', clearHistory);
   el.histSearch.addEventListener('input', renderHistory);
-  $('btnCloseCamera').addEventListener('click', closeCamera);
-  $('btnCapture').addEventListener('click', capture);
-  $('btnGallery').addEventListener('click', pickFile);
+  el.camInput.addEventListener('change', onFile);
   el.file.addEventListener('change', onFile);
   el.scrim.addEventListener('click', function () { if (el.modal.classList.contains('is-open')) closeModal(); else closeDrawer(); });
 
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape') {
-      if (cameraOpen()) { closeCamera(); return; }
       if (el.present.classList.contains('is-open')) { closePresent(); return; }
       if (el.modal.classList.contains('is-open')) { closeModal(); return; }
       if (drawerOpen()) closeDrawer();
@@ -2761,7 +2678,18 @@ const APP_JS = String.raw`
       params.delete('action');
       var qs = params.toString();
       history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
-      if (action === 'camera') setTimeout(openCamera, 250); else setTimeout(openDrawer, 120);
+      // 文件选择器要求一次真实的用户点击，深链带不来瞬时授权，所以只能高亮按钮引导一下
+      if (action === 'camera') {
+        setTimeout(function () {
+          var b = $('btnCamera');
+          b.classList.add('is-on');
+          b.focus();
+          toast('点相机按钮即可拍照识别');
+          setTimeout(function () { b.classList.remove('is-on'); }, 2600);
+        }, 200);
+      } else {
+        setTimeout(openDrawer, 120);
+      }
     }
   } catch (e) {}
 

@@ -74,7 +74,7 @@ const CONTEXT_TOKENS = 8192;       // 主模型的保守上下文窗口，用于
 const RESERVED_TOKENS = 512;       // 给 system prompt 与采样余量留的缓冲
 const TEMPERATURE = 0.2;           // 翻译任务低温求稳
 const AUTO_DEBOUNCE_MS = 1200;     // 自动翻译：停止输入后多久发起请求
-const APP_VERSION = 'v12';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
+const APP_VERSION = 'v13';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
 const SW_VERSION = 'ai-trans-' + APP_VERSION;
 const HISTORY_LIMIT = 50;
 
@@ -1265,6 +1265,8 @@ const ICONS = `
 
 const CSS = String.raw`
 :root {
+  color-scheme:light;
+  --sb:rgba(15,23,41,.22); --sb-hover:rgba(15,23,41,.38);
   --brand-1:#4f46e5; --brand-2:#06b6d4;
   --accent:#4f46e5; --accent-hover:#4338ca; --accent-soft:#eef0ff; --accent-line:#dfe2ff;
   --surface:#ffffff; --surface-2:#f7f8fc; --surface-3:#eceef6;
@@ -1281,6 +1283,8 @@ const CSS = String.raw`
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 [data-theme="dark"] {
+  color-scheme:dark;
+  --sb:rgba(255,255,255,.16); --sb-hover:rgba(255,255,255,.32);
   --accent:#93a1ff; --accent-hover:#b6c0ff; --accent-soft:rgba(147,161,255,.16); --accent-line:rgba(147,161,255,.34);
   --surface:#141a28; --surface-2:#1a2133; --surface-3:#232c42;
   --text:#e9eefb; --text-2:#a3aec6; --text-3:#75809a;
@@ -1307,6 +1311,16 @@ svg.ic { width:1em; height:1em; fill:none; stroke:currentColor; stroke-width:1.9
 :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:8px; }
 ::selection { background:var(--accent-soft); }
 * { -webkit-tap-highlight-color:transparent; }
+
+/* ---------- 滚动条 ----------
+   不接管的话 WebKit 在深色面板上仍画系统浅色条，跟主题对不上；
+   透明边框 + background-clip 让滑块视觉上变细，hover 时再加深。 */
+* { scrollbar-width:thin; scrollbar-color:var(--sb) transparent; }
+::-webkit-scrollbar { width:10px; height:10px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--sb); border:3px solid transparent; border-radius:99px; background-clip:content-box; }
+::-webkit-scrollbar-thumb:hover { background:var(--sb-hover); background-clip:content-box; }
+::-webkit-scrollbar-corner { background:transparent; }
 button,select,label,input,textarea { touch-action:manipulation; }
 .sr-only { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 .sr { position:absolute; top:0; left:0; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }

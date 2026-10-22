@@ -74,7 +74,7 @@ const CONTEXT_TOKENS = 8192;       // 主模型的保守上下文窗口，用于
 const RESERVED_TOKENS = 512;       // 给 system prompt 与采样余量留的缓冲
 const TEMPERATURE = 0.2;           // 翻译任务低温求稳
 const AUTO_DEBOUNCE_MS = 1200;     // 自动翻译：停止输入后多久发起请求
-const APP_VERSION = 'v8';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
+const APP_VERSION = 'v10';          // 每次改动前端资源必须递增：SW 缓存名与 ?v= 都跟着失效
 const SW_VERSION = 'ai-trans-' + APP_VERSION;
 const HISTORY_LIMIT = 50;
 
@@ -1037,8 +1037,8 @@ function manifestResponse() {
     display: 'standalone',
     display_override: ['standalone', 'minimal-ui'],
     orientation: 'portrait-primary',
-    background_color: '#eef0f6',
-    theme_color: '#4f46e5',
+    background_color: '#ffffff',
+    theme_color: '#ffffff',
     categories: ['utilities', 'productivity', 'travel'],
     shortcuts: [
       { name: '拍照识别', short_name: '拍照', url: '/?action=camera', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml' }] },
@@ -1207,9 +1207,9 @@ function htmlResponse() {
 
 const THEME_JS = String.raw`
 (function () {
-  var KEY = 'ai-trans:theme';
+  // 必须读应用真正写入的那个键，否则手动选的主题在刷新时会被忽略、先闪一下错误配色
   var saved = null;
-  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  try { saved = JSON.parse(localStorage.getItem('ai-trans:prefs') || '{}').theme; } catch (e) {}
   var dark = saved ? saved === 'dark'
     : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
@@ -1264,30 +1264,28 @@ const CSS = String.raw`
 :root {
   --brand-1:#4f46e5; --brand-2:#06b6d4;
   --accent:#4f46e5; --accent-hover:#4338ca; --accent-soft:#eef0ff; --accent-line:#dfe2ff;
-  --bg:#eef0f6; --surface:#ffffff; --surface-2:#f7f8fc; --surface-3:#eceef6;
+  --surface:#ffffff; --surface-2:#f7f8fc; --surface-3:#eceef6;
   --text:#0f1729; --text-2:#55617a; --text-3:#8b96ad;
   --line:#e5e8f1; --line-strong:#d5daea;
   --danger:#e11d48; --danger-soft:#fff1f3;
   --ok:#0d9488; --warn:#b45309; --warn-soft:#fff7e8;
   --ring:rgba(79,70,229,.30);
   --shadow-1:0 1px 2px rgba(15,23,41,.05);
-  --shadow-3:0 24px 60px -28px rgba(15,23,41,.30);
   --shadow-pop:0 20px 52px -20px rgba(15,23,41,.36);
-  --radius:12px; --radius-lg:18px; --radius-xl:24px;
+  --radius:12px; --radius-lg:18px;
   --blur:saturate(180%) blur(14px);
   --font:-apple-system,BlinkMacSystemFont,'PingFang SC','HarmonyOS Sans SC','Microsoft YaHei','Segoe UI',Roboto,system-ui,sans-serif;
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 [data-theme="dark"] {
   --accent:#93a1ff; --accent-hover:#b6c0ff; --accent-soft:rgba(147,161,255,.16); --accent-line:rgba(147,161,255,.34);
-  --bg:#05070e; --surface:#141a28; --surface-2:#1a2133; --surface-3:#232c42;
+  --surface:#141a28; --surface-2:#1a2133; --surface-3:#232c42;
   --text:#e9eefb; --text-2:#a3aec6; --text-3:#75809a;
   --line:rgba(255,255,255,.10); --line-strong:rgba(255,255,255,.18);
   --danger:#ff8ba0; --danger-soft:rgba(255,139,160,.14);
   --ok:#5eead4; --warn:#fbbf24; --warn-soft:rgba(251,191,36,.14);
   --ring:rgba(147,161,255,.42);
   --shadow-1:0 1px 2px rgba(0,0,0,.5);
-  --shadow-3:0 28px 70px -28px rgba(0,0,0,.92);
   --shadow-pop:0 28px 70px -24px rgba(0,0,0,.92);
 }
 
@@ -1295,21 +1293,10 @@ const CSS = String.raw`
 [hidden] { display:none !important; }
 html,body { height:100%; }
 body {
-  margin:0; font-family:var(--font); color:var(--text); background:var(--bg);
+  margin:0; font-family:var(--font); color:var(--text); background:var(--surface);
   font-size:15px; line-height:1.6; overflow-x:hidden;
   -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
   transition:background-color .3s ease, color .3s ease;
-}
-body::before {
-  content:''; position:fixed; inset:0; z-index:0; pointer-events:none;
-  background:
-    radial-gradient(680px 420px at 12% -8%, rgba(79,70,229,.16), transparent 60%),
-    radial-gradient(560px 380px at 92% 4%, rgba(6,182,212,.14), transparent 62%);
-}
-[data-theme="dark"] body::before {
-  background:
-    radial-gradient(720px 460px at 10% -10%, rgba(99,102,241,.26), transparent 60%),
-    radial-gradient(600px 420px at 94% 0%, rgba(6,182,212,.16), transparent 62%);
 }
 button,input,select,textarea { font:inherit; color:inherit; }
 button { border:0; background:none; cursor:pointer; }
@@ -1319,16 +1306,13 @@ svg.ic { width:1em; height:1em; fill:none; stroke:currentColor; stroke-width:1.9
 * { -webkit-tap-highlight-color:transparent; }
 button,select,label,input,textarea { touch-action:manipulation; }
 .sr-only { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
-.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+.sr { position:absolute; top:0; left:0; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
 
-/* ---------- 外框 ---------- */
+/* ---------- 主体 ----------
+   全幅铺满视口，不做悬浮卡片：外围留白和背景光晕只会吃掉输入区的高度。 */
 .app {
-  position:relative; z-index:1; width:min(1120px,100%); min-height:100dvh;
-  margin:0 auto; display:flex; flex-direction:column;
-  background:var(--surface); border-inline:1px solid var(--line); box-shadow:var(--shadow-3);
-}
-@media (min-width:900px) {
-  .app { margin:28px auto 40px; min-height:min(880px,calc(100dvh - 68px)); border-radius:var(--radius-xl); overflow:hidden; }
+  min-height:100dvh; display:flex; flex-direction:column;
+  background:var(--surface);
 }
 
 /* ---------- 顶栏 ---------- */
@@ -1859,7 +1843,7 @@ const APP_JS = String.raw`
     var dark = isDark();
     $('themeIcon').innerHTML = '<use href="#' + (dark ? 'i-sun' : 'i-moon') + '"/>';
     var meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', dark ? '#05070e' : '#ffffff');
+    if (meta) meta.setAttribute('content', dark ? '#141a28' : '#ffffff');
   }
   function toggleTheme() {
     prefs.theme = isDark() ? 'light' : 'dark';
